@@ -2,61 +2,80 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class Encoder(nn.Module):
-    """Maps raw observations into a latent state."""
-    def __init__(self, input_dim, latent_dim):
+class FiLMLayer(nn.Module):
+    """Applies Feature-wise Linear Modulation (FiLM)."""
+    def __init__(self, cond_dim, feature_dim):
+        super().__init__()
+        # Outputs both gamma (scale) and beta (shift)
+        self.fc = nn.Linear(cond_dim, feature_dim * 2)
+        
+    def forward(self, x, condition):
+        gamma_beta = self.fc(condition)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
+        return (1 + gamma) * x + beta
+
+class CNNEncoder(nn.Module):
+    """Maps 3x32x32 image observations into a latent state."""
+    def __init__(self, latent_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 128),
+            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1),  # -> 16x16
             nn.ReLU(),
-            nn.Linear(128, latent_dim)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), # -> 8x8
+            nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),# -> 4x4
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(128 * 4 * 4, latent_dim)
         )
 
     def forward(self, x):
         return self.net(x)
 
-class Decoder(nn.Module):
-    """Maps latent states back to the observation space."""
-    def __init__(self, latent_dim, output_dim):
+class CNNDecoder(nn.Module):
+    """Maps latent states back to 3x32x32 image observations."""
+    def __init__(self, latent_dim=256):
         super().__init__()
+        self.fc = nn.Linear(latent_dim, 128 * 4 * 4)
         self.net = nn.Sequential(
-            nn.Linear(latent_dim, 128),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1), # -> 8x8
             nn.ReLU(),
-            nn.Linear(128, output_dim)
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # -> 16x16
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),   # -> 32x32
+            nn.Sigmoid() # Constrain outputs to [0, 1] for valid image pixels
         )
 
     def forward(self, z):
-        return self.net(z)
+        x = self.fc(z)
+        x = x.view(-1, 128, 4, 4)
+        return self.net(x)
 
 class Programmer(nn.Module):
-    """
-    Acts as the 'Language of Thought' generator.
-    Given the current state and target state, it predicts the next primitive operation.
-    """
+    """Generates the next primitive operation using FiLM conditioning."""
     def __init__(self, latent_dim, num_primitives):
         super().__init__()
-        # Takes current latent state and target latent state
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim * 2, 128),
+        self.film = FiLMLayer(cond_dim=latent_dim, feature_dim=latent_dim)
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, 128),
             nn.ReLU(),
             nn.Linear(128, num_primitives)
         )
 
     def forward(self, current_state, target_state):
-        x = torch.cat([current_state, target_state], dim=-1)
-        logits = self.net(x)
+        # The target state modulates the current state representation
+        modulated_state = self.film(current_state, target_state)
+        logits = self.fc(modulated_state)
         return logits
 
 class Executor(nn.Module):
-    """
-    The shared transition model.
-    Applies the chosen primitive to the current state to produce the next state.
-    """
+    """Applies the chosen primitive to the current state using FiLM."""
     def __init__(self, latent_dim, num_primitives):
         super().__init__()
         self.primitive_embeddings = nn.Linear(num_primitives, latent_dim, bias=False)
+        self.film = FiLMLayer(cond_dim=latent_dim, feature_dim=latent_dim)
         self.transition = nn.Sequential(
-            nn.Linear(latent_dim * 2, 128),
+            nn.Linear(latent_dim, 128),
             nn.ReLU(),
             nn.Linear(128, latent_dim)
         )
@@ -64,34 +83,22 @@ class Executor(nn.Module):
     def forward(self, state, primitive_onehot):
         # Embed the discrete primitive choice
         z_emb = self.primitive_embeddings(primitive_onehot)
-        # Apply transition
-        x = torch.cat([state, z_emb], dim=-1)
-        next_state = self.transition(x)
+        # The chosen action modulates the current state
+        modulated_state = self.film(state, z_emb)
+        next_state = self.transition(modulated_state)
         return next_state
 
 class NeuralTheorizer(nn.Module):
-    """
-    The full NEO model implementing Learning-to-Theorize (L2T).
-    """
-    def __init__(self, input_dim, latent_dim=64, num_primitives=10, max_steps=5):
+    def __init__(self, latent_dim=256, num_primitives=8, max_steps=3):
         super().__init__()
         self.max_steps = max_steps
         
-        self.encoder = Encoder(input_dim, latent_dim)
-        self.decoder = Decoder(latent_dim, input_dim)
+        self.encoder = CNNEncoder(latent_dim)
+        self.decoder = CNNDecoder(latent_dim)
         self.programmer = Programmer(latent_dim, num_primitives)
         self.executor = Executor(latent_dim, num_primitives)
 
     def forward(self, x, y, tau=1.0, hard=True):
-        """
-        x: Source observation (before)
-        y: Target observation (after)
-        tau: Temperature for Gumbel-Softmax
-        hard: Whether to use straight-through gradient estimation
-        """
-        batch_size = x.size(0)
-        
-        # 1. Encode source and target
         s_t = self.encoder(x)
         s_target = self.encoder(y)
         
@@ -99,20 +106,14 @@ class NeuralTheorizer(nn.Module):
         intermediate_reconstructions = []
         primitive_choices = []
         
-        # 2. Induce latent program step-by-step
         for step in range(self.max_steps):
-            # Programmer selects the next primitive
             logits = self.programmer(s_t, s_target)
-            
-            # Gumbel-Softmax allows differentiable sampling of discrete primitives
             z_t = F.gumbel_softmax(logits, tau=tau, hard=hard)
             primitive_choices.append(z_t)
             
-            # Executor applies the primitive
             s_t = self.executor(s_t, z_t)
             intermediate_states.append(s_t)
             
-            # Decode to check if we've reached the target
             y_hat = self.decoder(s_t)
             intermediate_reconstructions.append(y_hat)
             
@@ -124,28 +125,30 @@ class NeuralTheorizer(nn.Module):
         }
 
     def compute_loss(self, x, y):
-        """
-        Computes the L2T objective: 
-        Finds the shortest latent program that successfully reconstructs the target.
-        """
         outputs = self(x, y)
         reconstructions = outputs["reconstructions"]
         
         losses = []
-        # Calculate reconstruction loss at each step
+        state_grounding_losses = []
+        
         for y_hat in reconstructions:
-            step_loss = F.mse_loss(y_hat, y, reduction='none').mean(dim=-1)
+            # 1. Target Reconstruction Loss
+            # Using MSE over the image spatial dimensions (C, H, W)
+            step_loss = F.mse_loss(y_hat, y, reduction='none').view(y.size(0), -1).mean(dim=-1)
             losses.append(step_loss)
             
-        losses = torch.stack(losses, dim=1) # Shape: (batch_size, max_steps)
-        
-        # Adaptive Explanation Length: 
-        # NEO selects the shortest accurate explanation. We can approximate this by 
-        # taking the minimum loss across the trajectory (or stopping early when loss < threshold).
+            # 2. State Grounding Loss (Total Variation)
+            # Ensures intermediate states decode into smooth, continuous images, 
+            # anchoring the latent space representations to the image manifold.
+            tv_loss = torch.mean(torch.abs(y_hat[:, :, :, :-1] - y_hat[:, :, :, 1:])) + \
+                      torch.mean(torch.abs(y_hat[:, :, :-1, :] - y_hat[:, :, 1:, :]))
+            state_grounding_losses.append(tv_loss)
+            
+        losses = torch.stack(losses, dim=1) 
         min_loss, optimal_steps = torch.min(losses, dim=1)
         
-        # We can also add a penalty for program length to encourage parsimony
         length_penalty = (optimal_steps.float() * 0.01)
+        avg_grounding_loss = torch.stack(state_grounding_losses).mean() * 0.1
         
-        total_loss = (min_loss + length_penalty).mean()
+        total_loss = (min_loss + length_penalty).mean() + avg_grounding_loss
         return total_loss
