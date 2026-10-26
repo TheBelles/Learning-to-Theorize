@@ -1,133 +1,118 @@
-<div align="center">
-  <h1>
-    <em>
-      Learning to Theorize the World from Observation
-    </em>
-  </h1>
+# Theorizing Collisions: Composable Physics Programs from Video
 
-  <p>
-    <a href="https://doojinbaek.github.io/publications/learning-to-theorize-the-world/">
-      <img src="https://img.shields.io/badge/Project_Page-Website-2ea44f?style=flat-square" alt="Project Page">
-    </a>
-    <a href="https://arxiv.org/abs/2605.03413">
-      <img src="https://img.shields.io/badge/arXiv-2605.03413-b31b1b?style=flat-square&logo=arxiv&logoColor=white" alt="arXiv">
-    </a>
-    <a href="https://icml.cc/virtual/2026/oral/71176">
-      <img src="https://img.shields.io/badge/ICML_2026-Oral-6f42c1?style=flat-square" alt="ICML 2026 Oral">
-    </a>
-    <a href="https://compositional-learning.github.io/#:~:text=Doojin%20Baek%2C%20Gyubin%20Lee%2C%20Junyeob%20Baek%2C%20Hosung%20Lee%2C%20Sungjin%20Ahn.%20Learning%20to%20Theorize%20the%20World%20from%20Observation.">
-      <img src="https://img.shields.io/badge/CompLearn_2026-Best_Paper-f2b01e?style=flat-square" alt="CompLearn 2026 Best Paper">
-    </a>
-  </p>
+Can a model learn the **physics** of a collision as a small set of reusable
+operations, rather than memorising what collisions look like?
 
-  <p>
-    <a href="https://doojinbaek.github.io/">Doojin Baek</a><sup>&#42;</sup>,
-    <a href="https://lee-gyubin.github.io/">Gyubin Lee</a><sup>&#42;</sup>,
-    <a href="https://dion-jy.github.io/">Junyeob Baek</a>,
-    <a href="https://confeitohs.notion.site/">Hosung Lee</a>, and
-    <a href="https://mlml.kaist.ac.kr/sungjinahn">Sungjin Ahn</a>
-  </p>
+Video models trained on PhyWorld's simulated collisions predict well inside
+the speeds they were trained on but fail outside them. This project asks
+whether a latent program-induction model does better. The model encodes
+before/after observations, describes the change between them as a short
+program built from a learned codebook of primitive operations, and must reuse
+that program on a new collision. If it learns one primitive per time step, it
+should handle longer horizons and unseen speeds by composing steps it already
+knows.
 
-  <p><sup>&#42;</sup> Equal contribution</p>
+> **Status:** work in progress. The pipeline is complete; results below will
+> be filled in as runs finish.
 
-  <p>
-    <strong>
-      Official PyTorch code for the
-      <a href="https://icml.cc/virtual/2026/poster/60765">ICML 2026 Oral</a>
-      paper, recipient of the
-      <a href="https://compositional-learning.github.io/">CompLearn 2026 Best Paper Award</a>.
-    </strong>
-  </p>
-</div>
+## Task
 
-<p align="center">
-  <img src="assets/l2t-framework.png" alt="Learning-to-Theorize framework" width="100%">
-</p>
+Two balls move toward each other horizontally and collide elastically (red:
+ball 1, from the left; blue: ball 2, from the right). The data is PhyWorld's
+two-ball collision set: 32 frames per video, 0.1 s apart, speeds 1–4 and radii
+0.5–1.5 in a 10×10 world.
 
-Neural Theorizer (NEO) instantiates Learning-to-Theorize (L2T) as latent
-program induction. From raw before-and-after observations, NEO learns reusable
-primitive operations and composes them into executable theories that transfer
-to new observations.
+| | |
+| --- | --- |
+| **Observation** | Two frames, `t − k` and `t` (`k` = 2 by default), so it shows positions **and** velocities. Pixels: 64×64×6. States: x, y, vx, vy, r for each ball. |
+| **Pair** | `x = obs(t)`, `y = obs(t + Δ·k)`: the scene before and after Δ time steps. |
+| **Episode** | A support pair from one video and a query pair from a different video, with the same Δ. They share only the physics. |
+| **Program** | Up to 4 operations from a codebook of 8 learned primitives. Its length is chosen by a minimum-description-length rule. |
+| **Test** | The program (and its length) is inferred on the support pair and executed on the query pair. |
+
+Generalisation is measured on videos never seen in training:
+
+- **ID:** same speeds and radii as training, with and without the contact inside the window;
+- **Length OOD:** Δ = 5–8 when training used Δ = 1–4;
+- **Velocity OOD:** speeds outside [1, 4].
 
 ## Setup
 
-Use Python 3.10 and PyTorch 2.7.1 with CUDA 12.6. The pinned installation is in
-[environments/README.md](environments/README.md).
-
-## Train and evaluate
-
-The same scripts support `gridworld`, `arithmetic_factorization`, and
-`image_editing`. For example, from the repository root:
+Python 3.10, PyTorch 2.7.1, CUDA 12.6 (pinned environment in
+[environments/README.md](environments/README.md)), then:
 
 ```bash
-python scripts/generate_data.py --task gridworld --data-root data/gridworld
-python scripts/download_checkpoints.py --task gridworld --output-root checkpoints
-
-python scripts/train.py --task gridworld \
-  --alpha all --seed all --devices 0 \
-  --data-root data/gridworld --output-root runs/gridworld/train \
-  --observation-checkpoint checkpoints/gridworld/observation/best_reconstruction/checkpoint_2206.pt
-
-python scripts/evaluate.py --task gridworld \
-  --alpha all --seed all --devices 0 \
-  --data-root data/gridworld --training-root runs/gridworld/train \
-  --output-root runs/gridworld/evaluate
+pip install -e .
+pip install imageio imageio-ffmpeg huggingface_hub
 ```
 
-Training runs the three alpha values and seeds 42, 43, 44. Evaluation selects
-checkpoints by ID query transfer, then evaluates the selected weights on ID,
-compositional OOD and length OOD. Hard grounding is ON for GridWorld and
-Arithmetic, and OFF for ImageEditing, in both selection and final evaluation.
+Check the installation on CPU (a few minutes, tiny simulated data):
 
-Use a new output directory for each run. Add `--dry-run` to inspect commands.
-W&B is enabled by default; `--wandb-mode offline` saves logs locally.
+```bash
+CUDA_VISIBLE_DEVICES= python -m pytest -q tests/test_phyworld_collision.py
+SMOKE=1 bash scripts/phyworld_collision.sh
+```
 
-[Training and evaluation guide](docs/reproduction.md) covers all three tasks,
-observation pretraining, checkpoint paths and NEO-S. ImageEditing requires two
-training GPUs; GridWorld and Arithmetic require one each. The release provides
-observation weights; train NEO with the commands above.
+## Run
 
-## PhyWorld collisions
+The whole pipeline:
 
-`src/tasks/phyworld_collision/` applies NEO to the two-ball collision videos of
-[PhyWorld](https://github.com/phyworld/phyworld): programs that advance a
-collision by a number of time steps, evaluated on unseen videos, longer
-horizons and out-of-distribution speeds. See
-[docs/phyworld_collision.md](docs/phyworld_collision.md); a CPU smoke run is
-`SMOKE=1 bash scripts/phyworld_collision.sh`.
+```bash
+bash scripts/phyworld_collision.sh                  # pixels
+MODALITY=states bash scripts/phyworld_collision.sh  # state vectors (fast, start here)
+```
+
+It runs these stages in order:
+
+1. **Data.** It downloads `collision_30K.hdf5` from [PhyWorld on Hugging Face](https://huggingface.co/datasets/magicr/phyworld) and simulates an OOD-speed set in the same format.
+2. **Episodes.** It converts videos into support/query episodes, with separate train, ID-test, length-OOD and velocity-OOD files.
+3. **Observation model.** It pretrains a VAE that is frozen afterwards. Check `reconstructions_epoch*.png` to see that both balls are sharp.
+4. **Theorizer.** It trains the program-induction model; `checkpoints/best.pt` is selected by ID query error.
+5. **Evaluation.** It computes transfer error, program length vs. Δ, ball position and velocity errors against constant-velocity and copy baselines, and which primitives are used.
+
+Every stage can also be run on its own, and every training setting can be
+changed with `--set name=value`. See
+[docs/phyworld_collision.md](docs/phyworld_collision.md) for the commands,
+options and how to read the results.
 
 ## Results
 
-[Results](docs/results.md) compares three-seed means and standard deviations
-with the paper. Per-seed scores are in [configs/results.json](configs/results.json).
-This repository implements NEO and NEO-S. Paper baseline values are provided
-for reference; baseline implementations are not included.
+To be filled in.
+
+| Split | Query error | Program length = Δ | Velocity error (all) | Velocity error (with contact) | Constant-velocity baseline (with contact) |
+| --- | --- | --- | --- | --- | --- |
+| ID | | | | | |
+| Length OOD (Δ 5–8) | | | | | |
+| Velocity OOD | | | | | |
+
+Errors are in world units (the world is 10 units wide).
 
 ## Code
 
-- `src/models/`: NEO, the theory programmer, executor and vector quantizer.
-- `src/tasks/`: task models, datasets, training and evaluation.
-- `scripts/`: data generation, pretraining, training and evaluation commands.
-- `configs/`: checkpoint manifest and reported results.
+| Path | Contents |
+| --- | --- |
+| `src/tasks/phyworld_collision/physics.py` | Constants, rendering, closed-form collision simulator, ball tracking |
+| `src/tasks/phyworld_collision/data/` | PhyWorld file reader, OOD simulator, episode converter, datasets |
+| `src/tasks/phyworld_collision/models/vae.py` | Observation models for stacked frames and state vectors |
+| `src/tasks/phyworld_collision/objective.py` | Foreground-weighted losses and metrics |
+| `src/tasks/phyworld_collision/observation_pretraining.py` | VAE pretraining |
+| `src/tasks/phyworld_collision/theorizer_runner.py` | Training |
+| `src/tasks/phyworld_collision/evaluation.py` | Evaluation and physics metrics |
+| `scripts/phyworld_collision.sh` | End-to-end pipeline |
+| `tests/test_phyworld_collision.py` | Unit tests and a CPU end-to-end run |
 
-Run the tests with `CUDA_VISIBLE_DEVICES= python -m pytest -q tests`.
-The CPU test suite also runs on every pull request and push to `main`.
-[Third-party notices](docs/third-party-notices.md) accompany the relevant source.
+## Team
 
-## License
+_Add team members here._
 
-The code and released pretrained observation weights are available under the
-[MIT License](LICENSE). Third-party components retain their original licenses;
-see [third-party notices](docs/third-party-notices.md).
+## Acknowledgements and license
 
-## Citation
+This project is built on the open-source
+[Learning to Theorize](https://github.com/ahn-ml/learning-to-theorize)
+codebase (NEO model, theory programmer, executor and quantizer) and uses the
+[PhyWorld](https://github.com/phyworld/phyworld) collision data and generator
+settings.
 
-```bibtex
-@inproceedings{baek2026learning,
-  title     = {Learning to Theorize the World from Observation},
-  author    = {Baek, Doojin and Lee, Gyubin and Baek, Junyeob and Lee, Hosung and Ahn, Sungjin},
-  booktitle = {Proceedings of the 43rd International Conference on Machine Learning},
-  year      = {2026},
-  url       = {https://arxiv.org/abs/2605.03413}
-}
-```
+The code is under the MIT License ([LICENSE](LICENSE)). The vector-quantizer
+files remain under the Apache License 2.0; see
+[third-party notices](docs/third-party-notices.md).
