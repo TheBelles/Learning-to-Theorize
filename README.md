@@ -87,6 +87,15 @@ observation pretraining, checkpoint paths and NEO-S. ImageEditing requires two
 training GPUs; GridWorld and Arithmetic require one each. The release provides
 observation weights; train NEO with the commands above.
 
+## PhyWorld collisions
+
+`src/tasks/phyworld_collision/` applies NEO to the two-ball collision videos of
+[PhyWorld](https://github.com/phyworld/phyworld): programs that advance a
+collision by a number of time steps, evaluated on unseen videos, longer
+horizons and out-of-distribution speeds. See
+[docs/phyworld_collision.md](docs/phyworld_collision.md); a CPU smoke run is
+`SMOKE=1 bash scripts/phyworld_collision.sh`.
+
 ## Results
 
 [Results](docs/results.md) compares three-seed means and standard deviations

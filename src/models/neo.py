@@ -250,10 +250,10 @@ class NEO(nn.Module, Generic[MetricT]):
         if transitions < 1:
             raise ValueError("num_transitions must be positive")
         self.objective.validate_batch(batch, is_eval=is_eval)
-        inputs, targets = self.objective.split_batch(batch)
+        inputs, targets = self.objective.split_batch(batch)                                         # 2. Sample a minibatch
 
         all_observations = torch.cat([inputs, targets], dim=0)
-        all_states, posterior = self.encoder(all_observations)
+        all_states, posterior = self.encoder(all_observations)                                      # 3. Encoding all observations here
         if posterior is None:
             raise RuntimeError("NEO requires a variational observation encoder")
         auto_predictions = self.decoder(all_states)
@@ -275,8 +275,8 @@ class NEO(nn.Module, Generic[MetricT]):
         action_vq_by_length: list[ActionQuantizerOutput] = []
         consistency_by_length: list[Tensor] = []
 
-        for _ in range(transitions):
-            actions = self.theory_programmer(current.detach(), target_states)
+        for _ in range(transitions):                                                                # 4. For every transition
+            actions = self.theory_programmer(current.detach(), target_states)                       # 5. Sample a primitive
             if is_eval:
                 actions = (
                     actions[::2]
@@ -286,8 +286,8 @@ class NEO(nn.Module, Generic[MetricT]):
                 )
             quantized = self.quantizer(actions, training_mode=not is_eval)
             action_vq_by_length.append(quantized)
-            current = self.program_executor(current, quantized.values)
-            predicted_states.append(current.clone())
+            current = self.program_executor(current, quantized.values)                              # 6. Exectuing primitives
+            predicted_states.append(current.clone())                                                # 7. End for
 
             with torch.no_grad():
                 decoded = self.objective.decode_prediction(self.decoder(current))
@@ -312,7 +312,7 @@ class NEO(nn.Module, Generic[MetricT]):
             weighted_losses.append(per_sample_loss * coefficient**length)
 
         with torch.no_grad():
-            selected_lengths = torch.stack(weighted_losses, dim=1).argmin(dim=1) + 1
+            selected_lengths = torch.stack(weighted_losses, dim=1).argmin(dim=1) + 1                # 8. Length Selection
             # Descending assignment makes the shortest exact solution win.
             for length in range(len(decoded_by_length), 0, -1):
                 correct = self.objective.exact_match(
@@ -327,7 +327,7 @@ class NEO(nn.Module, Generic[MetricT]):
                 selected_lengths[1::2] = selected_lengths[::2]
 
         transition_consistency_loss = self.reduce_consistency_loss(
-            torch.stack(consistency_by_length, dim=0),
+            torch.stack(consistency_by_length, dim=0),                                              # 10. State grounding loss
             selected_lengths,
         )
 
@@ -349,7 +349,7 @@ class NEO(nn.Module, Generic[MetricT]):
         # target. Distinct from grounding, which pulls each intermediate state
         # onto the manifold of valid observations; this pulls the endpoint onto
         # the target itself. Tasks that do not use it leave the weight at zero.
-        state_prediction_loss = F.mse_loss(selected_states, target_states.detach())
+        state_prediction_loss = F.mse_loss(selected_states, target_states.detach())                 
 
         action_vq_loss = torch.zeros(
             (),
@@ -363,7 +363,7 @@ class NEO(nn.Module, Generic[MetricT]):
         action_vq_loss = action_vq_loss / len(selected_lengths)
 
         if is_eval:
-            reconstruction_loss = self.objective.reconstruction_loss(
+            reconstruction_loss = self.objective.reconstruction_loss(                               # 9. Reconstruction Loss
                 selected_predictions[::2],
                 targets[::2],
             )
@@ -406,7 +406,7 @@ class NEO(nn.Module, Generic[MetricT]):
         loss = loss + training.auto_reconstruction_weight * auto_reconstruction_loss
         loss = loss + training.action_vq_weight * action_vq_loss
         loss = loss + getattr(training, "state_prediction_weight", 0.0) * (
-            state_prediction_loss
+            state_prediction_loss                                                                   # 11. Total Loss
         )
 
         return NEOOutput(

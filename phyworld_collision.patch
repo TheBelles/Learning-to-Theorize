@@ -1,0 +1,3716 @@
+diff --git a/README.md b/README.md
+index b1c8041..9c1eca9 100644
+--- a/README.md
++++ b/README.md
+@@ -87,6 +87,15 @@ observation pretraining, checkpoint paths and NEO-S. ImageEditing requires two
+ training GPUs; GridWorld and Arithmetic require one each. The release provides
+ observation weights; train NEO with the commands above.
+ 
++## PhyWorld collisions
++
++`src/tasks/phyworld_collision/` applies NEO to the two-ball collision videos of
++[PhyWorld](https://github.com/phyworld/phyworld): programs that advance a
++collision by a number of time steps, evaluated on unseen videos, longer
++horizons and out-of-distribution speeds. See
++[docs/phyworld_collision.md](docs/phyworld_collision.md); a CPU smoke run is
++`SMOKE=1 bash scripts/phyworld_collision.sh`.
++
+ ## Results
+ 
+ [Results](docs/results.md) compares three-seed means and standard deviations
+diff --git a/docs/phyworld_collision.md b/docs/phyworld_collision.md
+new file mode 100644
+index 0000000..cd1b971
+--- /dev/null
++++ b/docs/phyworld_collision.md
+@@ -0,0 +1,155 @@
++# NEO on PhyWorld two-ball collisions
++
++This task trains the Neural Theorizer (NEO) on the collision videos of
++PhyWorld ([Kang et al., 2024](https://github.com/phyworld/phyworld)). It lives
++in `src/tasks/phyworld_collision/` and does not change the paper's tasks or
++scripts.
++
++## The task
++
++| Concept | Choice |
++| --- | --- |
++| Observation | Two frames, `t - k` and `t` (`k = --frame-step`, default 2), so it shows positions **and** velocities. Pixels: `64×64×6` uint8. States: 10 numbers (x, y, vx, vy, r per ball). |
++| Pair | `x = obs(t)`, `y = obs(t + delta·k)` |
++| Episode | Support pair from video A, query pair from a different video B, **same delta**. The only thing they share is "advance time by delta steps", i.e. the physics. |
++| Program | NEO picks up to `max_transition_length` codes from a small codebook. Ideally it learns one "step" primitive and uses `delta` of them. |
++| Selection / test | Program (and its length) inferred on the support pair, executed on the query pair. |
++
++Generalisation tests, all from videos never seen in training:
++
++* **ID**: same speeds/radii as training (`id_test.h5`), plus a version where
++  every query window contains the contact (`id_test_collisions.h5`).
++* **Length OOD**: `delta` 5–8 while training used 1–4 (`length_ood.h5`).
++  This needs composition of learned steps.
++* **Velocity OOD**: speeds outside [1, 4] (`velocity_ood.h5`), the setting in
++  which video models fail in the PhyWorld paper.
++
++## Install
++
++Use the repository environment (`environments/README.md`), then
++`pip install imageio imageio-ffmpeg huggingface_hub` (the last two only for
++`--render video` and for downloading).
++
++Check everything works on CPU before using real data (1–3 minutes):
++
++```bash
++CUDA_VISIBLE_DEVICES= python -m pytest -q tests/test_phyworld_collision.py
++SMOKE=1 bash scripts/phyworld_collision.sh      # same pipeline as below on tiny simulated data
++```
++
++## Full run
++
++```bash
++bash scripts/phyworld_collision.sh
++```
++
++does all of the steps below; set `MODALITY=states` for the fast state-vector
++version (recommended first). Each step on its own:
++
++**1. Data.** Download `collision_30K.hdf5` from
++[magicr/phyworld](https://huggingface.co/datasets/magicr/phyworld/tree/main/id_ood_data)
++and look at its layout:
++
++```bash
++python -m tasks.phyworld_collision.data.phyworld_hdf5 data/phyworld/collision_30K.hdf5
++```
++
++OOD sets in the same format can be simulated (closed-form 1D collision,
++PhyWorld's placement and parameter grids, Box2D's inelastic threshold):
++
++```bash
++python -m tasks.phyworld_collision.data.simulate --preset ood-velocity-high --output data/phyworld/collision_ood_velocity.hdf5
++# presets: id-30k id-eval ood-velocity-low ood-velocity-high ood-radius-low ood-radius-high tiny
++```
++
++PhyWorld's own `collision_eval.hdf5` works too: `--filter ood-velocity`
++keeps the videos whose speeds are outside [1, 4].
++
++**2. Episodes.** One file per split; `--videos train/test` splits by video.
++
++```bash
++SRC=data/phyworld/collision_30K.hdf5
++C="python -m tasks.phyworld_collision.data.convert --frame-step 2 --image-size 64"
++$C --source $SRC --videos train --filter id --deltas 1,2,3,4 --episodes 60000 --output data/phyworld_collision/train.h5
++$C --source $SRC --videos test  --filter id --deltas 1,2,3,4 --episodes 5000  --output data/phyworld_collision/id_test.h5
++$C --source $SRC --videos test  --filter id --deltas 5,6,7,8 --episodes 5000  --output data/phyworld_collision/length_ood.h5
++$C --source data/phyworld/collision_ood_velocity.hdf5 --videos all --filter ood-velocity \
++   --deltas 1,2,3,4 --episodes 5000 --output data/phyworld_collision/velocity_ood.h5
++```
++
++Frames are drawn from the stored positions by default (`--render positions`,
++PhyWorld's own drawing code at 64 px). `--render video` decodes the MP4s and
++area-downsamples them instead. `--states-only` skips pixels.
++`--collision-fraction 0.5` makes half the windows contain the contact
++(naturally about a third do).
++
++**3. Observation model** (frozen during NEO training):
++
++```bash
++python -m tasks.phyworld_collision.observation_pretraining \
++  --train-h5 data/phyworld_collision/train.h5 --test-h5 data/phyworld_collision/id_test.h5 \
++  --output-root runs/phyworld_collision/observation --epochs 30
++```
++
++Open `reconstructions_epoch*.png` (left: input, right: reconstruction; each
++cell shows frame `t-k` and frame `t`). Both balls must be sharp before going
++on. The loss weights ball pixels 10× (`--foreground-weight`) so the model
++cannot get away with drawing an empty white image.
++
++**4. NEO:**
++
++```bash
++python -m tasks.phyworld_collision.theorizer_runner \
++  --train-h5 data/phyworld_collision/train.h5 --test-h5 data/phyworld_collision/id_test.h5 \
++  --observation-checkpoint runs/phyworld_collision/observation/pixels-*/checkpoints/best.pt \
++  --output-root runs/phyworld_collision/neo --seed 42
++```
++
++Override any field of `experiment_config.TrainingConfig` with
++`--set name=value`. `checkpoints/best.pt` has the lowest ID query loss.
++
++**5. Evaluation:**
++
++```bash
++python -m tasks.phyworld_collision.evaluation --checkpoint runs/.../checkpoints/best.pt \
++  --output-dir runs/phyworld_collision/eval \
++  --split id=data/phyworld_collision/id_test.h5 \
++  --split length_ood=data/phyworld_collision/length_ood.h5 \
++  --split velocity_ood=data/phyworld_collision/velocity_ood.h5
++```
++
++## Reading the results
++
++`evaluation.json` and the printed table give, per split and separately for
++query windows with and without the contact:
++
++| Metric | Meaning |
++| --- | --- |
++| `query_loss` | Error of the transferred program on the query pair (main L2T metric). |
++| `length_matches_delta` | Share of programs whose length equals `delta`. High = NEO uses one primitive per time step. |
++| `position_error`, `velocity_error` | Ball position at the last frame and velocity, world units (world = 10 wide), from tracking the red/blue balls in the predicted frames. |
++| `constant_velocity_*`, `copy_*` | Same errors for two references: extrapolating the true input motion with no collision, and predicting no motion. Beating constant velocity on windows **with** a contact is the evidence that NEO learned the collision. |
++| `programs`, `codebook_usage_first_step` | Which code sequences are used, overall, with/without contact and per `delta`. Look for a "move" code and a separate "bounce" code. |
++
++`<split>_examples.png` shows six columns per episode: support x, y, prediction,
++query x, y, prediction.
++
++## Knobs worth trying
++
++| Setting | Why |
++| --- | --- |
++| `--set action_codebook_size=4` (default 8) | Fewer codes leave less room to memorise and push toward reusable primitives. |
++| `--set length_control_start=1.05 --set length_control_end=1.0` | Anneal the MDL penalty, as in ImageEditing alpha 0.66. |
++| `--frame-step 1` or `3` | Smaller or larger time step per primitive. |
++| `MODALITY=states` | No vision: tests whether the program/primitive machinery can represent the collision law at all. |
++| `--collision-fraction 0.5` on train | More training signal about the contact. |
++
++## Notes
++
++* The simulator is exact for frictionless 1D elastic contact; Box2D's real
++  data differs by tiny integration and position-correction effects. The
++  converter and evaluation do not depend on which one produced the file.
++* Balls not fully inside the frame are excluded from the physics metrics (a
++  partly visible ball has a biased centroid).
++* High OOD speeds often do not fit in the 10-unit world with 8 frames before
++  contact; PhyWorld drops those scenes and so does the simulator.
+diff --git a/scripts/phyworld_collision.sh b/scripts/phyworld_collision.sh
+new file mode 100755
+index 0000000..068db7f
+--- /dev/null
++++ b/scripts/phyworld_collision.sh
+@@ -0,0 +1,93 @@
++#!/usr/bin/env bash
++# End-to-end NEO on PhyWorld two-ball collisions.
++#
++#   bash scripts/phyworld_collision.sh            # full run on collision_30K
++#   SMOKE=1 bash scripts/phyworld_collision.sh    # tiny simulated data, CPU, ~minutes
++#
++# Stages can be skipped by setting e.g. SKIP_DOWNLOAD=1 SKIP_CONVERT=1.
++# Every setting below can be overridden from the environment.
++set -euo pipefail
++cd "$(dirname "$0")/.."
++export PYTHONPATH="${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
++
++SMOKE="${SMOKE:-0}"
++RAW="${RAW:-data/phyworld}"                 # PhyWorld HDF5 files
++DATA="${DATA:-data/phyworld_collision}"     # converted episode files
++RUNS="${RUNS:-runs/phyworld_collision}"
++MODALITY="${MODALITY:-pixels}"              # pixels | states
++FRAME_STEP="${FRAME_STEP:-2}"               # raw frames per program step
++IMAGE_SIZE="${IMAGE_SIZE:-64}"
++TRAIN_DELTAS="${TRAIN_DELTAS:-1,2,3,4}"
++LENGTH_OOD_DELTAS="${LENGTH_OOD_DELTAS:-5,6,7,8}"
++SEED="${SEED:-42}"
++
++if [[ "$SMOKE" == "1" ]]; then
++  RAW="${RAW_SMOKE:-data/phyworld_smoke}"; DATA="${DATA_SMOKE:-data/phyworld_collision_smoke}"
++  RUNS="${RUNS_SMOKE:-runs/phyworld_collision_smoke}"
++  TRAIN_EPISODES=256; TEST_EPISODES=64; VAE_EPOCHS=1; NEO_SET=(--set epochs=1 --set batch_size=16 --set num_workers=0)
++  VAE_EXTRA=(--batch-size 32 --num-workers 0 --cpu); NEO_EXTRA=(--cpu); EVAL_EXTRA=(--cpu --batch-size 32)
++  SKIP_DOWNLOAD=1
++else
++  TRAIN_EPISODES="${TRAIN_EPISODES:-60000}"; TEST_EPISODES="${TEST_EPISODES:-5000}"; VAE_EPOCHS="${VAE_EPOCHS:-30}"
++  NEO_SET=(); VAE_EXTRA=(); NEO_EXTRA=(); EVAL_EXTRA=()
++fi
++SOURCE="${SOURCE:-$RAW/collision_30K.hdf5}"
++EVAL_SOURCE="${EVAL_SOURCE:-$RAW/collision_ood_velocity.hdf5}"
++STATES_FLAG=(); [[ "$MODALITY" == "states" ]] && STATES_FLAG=(--states-only)
++STATE_DIM="${STATE_DIM:-$([[ "$MODALITY" == "states" ]] && echo 64 || echo 256)}"
++mkdir -p "$RAW" "$DATA" "$RUNS"
++
++# 1. Data -------------------------------------------------------------------
++if [[ "$SMOKE" == "1" && ! -f "$SOURCE" ]]; then
++  python -m tasks.phyworld_collision.data.simulate --preset tiny --output "$SOURCE"
++  python -m tasks.phyworld_collision.data.simulate --preset ood-velocity-high --max-videos 60 --output "$EVAL_SOURCE"
++fi
++if [[ "${SKIP_DOWNLOAD:-0}" != "1" && ! -f "$SOURCE" ]]; then
++  # needs `pip install huggingface_hub`; or download in a browser from
++  # https://huggingface.co/datasets/magicr/phyworld/tree/main/id_ood_data
++  hf download magicr/phyworld id_ood_data/collision_30K.hdf5 --repo-type dataset --local-dir "$RAW"
++  mv "$RAW/id_ood_data/collision_30K.hdf5" "$SOURCE"
++fi
++if [[ ! -f "$EVAL_SOURCE" ]]; then
++  # OOD speeds 4.5-6.0 (and 0-0.8 with ood-velocity-low), simulated in PhyWorld's format.
++  # To use PhyWorld's own eval file instead: EVAL_SOURCE=$RAW/collision_eval.hdf5
++  python -m tasks.phyworld_collision.data.simulate --preset ood-velocity-high --output "$EVAL_SOURCE"
++fi
++python -m tasks.phyworld_collision.data.phyworld_hdf5 "$SOURCE" --max-items 3
++
++convert() {  # name source videos deltas episodes [extra...]
++  local name=$1 source=$2 videos=$3 deltas=$4 episodes=$5; shift 5
++  [[ -f "$DATA/$name.h5" ]] && { echo "exists: $DATA/$name.h5"; return; }
++  python -m tasks.phyworld_collision.data.convert --source "$source" --videos "$videos" \
++    --deltas "$deltas" --episodes "$episodes" --frame-step "$FRAME_STEP" --image-size "$IMAGE_SIZE" \
++    ${STATES_FLAG[@]+"${STATES_FLAG[@]}"} --output "$DATA/$name.h5" "$@"
++}
++if [[ "${SKIP_CONVERT:-0}" != "1" ]]; then
++  convert train        "$SOURCE"      train "$TRAIN_DELTAS"      "$TRAIN_EPISODES" --filter id --seed 0
++  convert id_test      "$SOURCE"      test  "$TRAIN_DELTAS"      "$TEST_EPISODES"  --filter id --seed 1
++  convert length_ood   "$SOURCE"      test  "$LENGTH_OOD_DELTAS" "$TEST_EPISODES"  --filter id --seed 2
++  convert velocity_ood "$EVAL_SOURCE" all   "$TRAIN_DELTAS"      "$TEST_EPISODES"  --filter ood-velocity --seed 3
++  convert id_test_collisions "$SOURCE" test "$TRAIN_DELTAS"     "$TEST_EPISODES"  --filter id --seed 4 --collision-fraction 1.0
++fi
++
++# 2. Observation model --------------------------------------------------------
++if [[ -z "${OBS_CKPT:-}" ]]; then
++  python -m tasks.phyworld_collision.observation_pretraining --modality "$MODALITY" --state-dim "$STATE_DIM" \
++    --train-h5 "$DATA/train.h5" --test-h5 "$DATA/id_test.h5" --output-root "$RUNS/observation" \
++    --epochs "$VAE_EPOCHS" --seed "$SEED" ${VAE_EXTRA[@]+"${VAE_EXTRA[@]}"}
++  OBS_CKPT="$(ls -td "$RUNS"/observation/"$MODALITY"-*/ | head -1)checkpoints/best.pt"
++fi
++echo "observation checkpoint: $OBS_CKPT"
++
++# 3. NEO ----------------------------------------------------------------------
++if [[ -z "${NEO_CKPT:-}" ]]; then
++  python -m tasks.phyworld_collision.theorizer_runner --train-h5 "$DATA/train.h5" --test-h5 "$DATA/id_test.h5" \
++    --observation-checkpoint "$OBS_CKPT" --output-root "$RUNS/neo" --seed "$SEED" ${NEO_SET[@]+"${NEO_SET[@]}"} ${NEO_EXTRA[@]+"${NEO_EXTRA[@]}"}
++  NEO_CKPT="$(ls -td "$RUNS"/neo/*/*/ | head -1)checkpoints/best.pt"
++fi
++echo "NEO checkpoint: $NEO_CKPT"
++
++# 4. Evaluation ---------------------------------------------------------------
++python -m tasks.phyworld_collision.evaluation --checkpoint "$NEO_CKPT" --output-dir "$RUNS/evaluation-seed$SEED" \
++  --split id="$DATA/id_test.h5" --split id_collisions="$DATA/id_test_collisions.h5" \
++  --split length_ood="$DATA/length_ood.h5" --split velocity_ood="$DATA/velocity_ood.h5" ${EVAL_EXTRA[@]+"${EVAL_EXTRA[@]}"}
+diff --git a/src/tasks/phyworld_collision/__init__.py b/src/tasks/phyworld_collision/__init__.py
+new file mode 100644
+index 0000000..9067db4
+--- /dev/null
++++ b/src/tasks/phyworld_collision/__init__.py
+@@ -0,0 +1 @@
++"""PhyWorld two-ball collision task for Learning to Theorize."""
+diff --git a/src/tasks/phyworld_collision/data/__init__.py b/src/tasks/phyworld_collision/data/__init__.py
+new file mode 100644
+index 0000000..45bc7a1
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/__init__.py
+@@ -0,0 +1 @@
++"""Data tools for the PhyWorld collision task."""
+diff --git a/src/tasks/phyworld_collision/data/convert.py b/src/tasks/phyworld_collision/data/convert.py
+new file mode 100644
+index 0000000..c5f7583
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/convert.py
+@@ -0,0 +1,202 @@
++"""Convert a PhyWorld collision HDF5 into one Learning-to-Theorize episode file.
++
++Run it once per split.  Typical set (``k = 2`` frames per step)::
++
++    SRC=data/phyworld/collision_30K.hdf5
++    python -m tasks.phyworld_collision.data.convert --source $SRC --videos train \\
++        --deltas 1,2,3,4 --episodes 60000 --output data/collision/train.h5
++    python -m tasks.phyworld_collision.data.convert --source $SRC --videos test \\
++        --deltas 1,2,3,4 --episodes 5000 --output data/collision/id_test.h5
++    python -m tasks.phyworld_collision.data.convert --source $SRC --videos test \\
++        --deltas 5,6,7,8 --episodes 5000 --output data/collision/length_ood.h5
++    python -m tasks.phyworld_collision.data.convert --source collision_eval.hdf5 \\
++        --videos all --filter ood-velocity --deltas 1,2,3,4 --episodes 5000 \\
++        --output data/collision/velocity_ood.h5
++
++``--videos train/test`` split the source *by video* with a fixed seed, so the
++test episodes always come from videos the model never saw.  Support and query
++of an episode come from two different videos of the same chunk.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++
++from tasks.phyworld_collision.data.episodes import (
++    FILTERS,
++    EpisodeWriter,
++    build_episode,
++    classify_videos,
++    rendered_frame_source,
++    valid_start_range,
++    video_split_mask,
++)
++from tasks.phyworld_collision.data.phyworld_hdf5 import PhyWorldCollisionFile
++from tasks.phyworld_collision.physics import downsample_frames
++
++
++def _parse_deltas(text: str) -> tuple[int, ...]:
++    values = tuple(sorted({int(part) for part in text.split(",") if part.strip()}))
++    if not values or min(values) < 1:
++        raise argparse.ArgumentTypeError("--deltas needs positive integers, e.g. 1,2,3,4")
++    return values
++
++
++def _allocate(counts: np.ndarray, total: int) -> np.ndarray:
++    """Split ``total`` episodes across chunks in proportion to eligible videos."""
++
++    usable = np.where(counts >= 2, counts, 0).astype(np.float64)
++    if usable.sum() == 0:
++        raise RuntimeError("no chunk has two eligible videos; check --filter and --videos")
++    raw = usable / usable.sum() * total
++    allocation = np.floor(raw).astype(int)
++    remainder = total - allocation.sum()
++    for index in np.argsort(-(raw - allocation))[:remainder]:
++        allocation[index] += 1
++    return allocation
++
++
++def convert(arguments: argparse.Namespace) -> dict:
++    rng = np.random.default_rng(arguments.seed)
++    deltas = arguments.deltas
++    has_pixels = not arguments.states_only
++    with PhyWorldCollisionFile(arguments.source) as source:
++        num_frames = None
++        chunk_info = []
++        for chunk in source.chunks():
++            num_frames = chunk.positions.shape[1]
++            labels = classify_videos(chunk.init)
++            chunk_info.append((chunk.first_index, len(chunk), labels))
++        for delta in deltas:
++            valid_start_range(delta, arguments.frame_step, num_frames)
++
++        split = video_split_mask(
++            source.num_videos,
++            arguments.videos,
++            test_fraction=arguments.test_fraction,
++            split_seed=arguments.split_seed,
++        )
++        eligible_per_chunk = []
++        for first, size, labels in chunk_info:
++            mask = FILTERS[arguments.filter](labels) & split[first : first + size]
++            eligible_per_chunk.append(np.flatnonzero(mask))
++        counts = np.array([len(e) for e in eligible_per_chunk])
++        allocation = _allocate(counts, arguments.episodes)
++
++        writer = EpisodeWriter(
++            path=arguments.output,
++            capacity=arguments.episodes,
++            image_size=arguments.image_size,
++            frame_step=arguments.frame_step,
++            deltas=deltas,
++            has_pixels=has_pixels,
++            attributes={
++                "source": str(Path(arguments.source).resolve()),
++                "videos": arguments.videos,
++                "filter": arguments.filter,
++                "render": arguments.render if has_pixels else "none",
++                "split_seed": arguments.split_seed,
++                "test_fraction": arguments.test_fraction,
++                "seed": arguments.seed,
++            },
++        )
++        label_counts: dict[str, int] = {}
++        collisions = 0
++        try:
++            for chunk, eligible, budget in zip(source.chunks(), eligible_per_chunk, allocation):
++                if budget == 0:
++                    continue
++                frame_source = None
++                if has_pixels and arguments.render == "positions":
++                    frame_source = rendered_frame_source(
++                        chunk.positions, chunk.radii, arguments.image_size
++                    )
++                elif has_pixels:
++                    decoded: dict[int, np.ndarray] = {}
++
++                    def frame_source(video: int, frames: np.ndarray, chunk=chunk, decoded=decoded):
++                        if video not in decoded:
++                            decoded[video] = downsample_frames(
++                                source.decode_video(chunk, video), arguments.image_size
++                            )
++                        return decoded[video][frames]
++
++                labels = classify_videos(chunk.init)
++                for _ in range(budget):
++                    support, query = rng.choice(eligible, size=2, replace=False)
++                    record = build_episode(
++                        rng,
++                        support_video=int(support),
++                        query_video=int(query),
++                        delta=int(rng.choice(deltas)),
++                        frame_step=arguments.frame_step,
++                        positions=chunk.positions,
++                        init=chunk.init,
++                        first_index=chunk.first_index,
++                        frame_source=frame_source,
++                        collision_fraction=arguments.collision_fraction,
++                    )
++                    writer.append(record)
++                    collisions += int(record.collides[1])
++                    for video in (support, query):
++                        label_counts[labels[video]] = label_counts.get(labels[video], 0) + 1
++                print(f"  {writer.count}/{arguments.episodes} episodes", flush=True)
++        finally:
++            writer.close()
++    summary = {
++        "output": str(arguments.output),
++        "episodes": writer.count,
++        "eligible_videos": int(counts.sum()),
++        "deltas": list(deltas),
++        "frame_step": arguments.frame_step,
++        "image_size": arguments.image_size if has_pixels else None,
++        "query_windows_with_collision": collisions / max(writer.count, 1),
++        "video_labels": label_counts,
++    }
++    return summary
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--source", type=Path, required=True, help="PhyWorld collision HDF5")
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--episodes", type=int, required=True)
++    parser.add_argument("--deltas", type=_parse_deltas, default=(1, 2, 3, 4))
++    parser.add_argument("--frame-step", type=int, default=2, help="raw frames per step (k)")
++    parser.add_argument("--image-size", type=int, default=64)
++    parser.add_argument(
++        "--render",
++        choices=("positions", "video"),
++        default="positions",
++        help="draw frames from stored positions (default) or decode the MP4s",
++    )
++    parser.add_argument("--states-only", action="store_true", help="skip pixels (state-vector runs)")
++    parser.add_argument("--videos", choices=("train", "test", "all"), default="all")
++    parser.add_argument("--test-fraction", type=float, default=0.1)
++    parser.add_argument("--split-seed", type=int, default=0)
++    parser.add_argument("--filter", choices=tuple(FILTERS), default="all")
++    parser.add_argument(
++        "--collision-fraction",
++        type=float,
++        help="probability that a window contains the contact (default: natural rate)",
++    )
++    parser.add_argument("--seed", type=int, default=0)
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    arguments = build_parser().parse_args(argv)
++    if arguments.frame_step < 1:
++        raise SystemExit("--frame-step must be positive")
++    summary = convert(arguments)
++    print(json.dumps(summary, indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/data/dataset.py b/src/tasks/phyworld_collision/data/dataset.py
+new file mode 100644
+index 0000000..4510cfc
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/dataset.py
+@@ -0,0 +1,153 @@
++"""PyTorch datasets over the episode files written by :mod:`.convert`."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Sequence
++
++import numpy as np
++import torch
++from torch.utils.data import Dataset
++
++from tasks.phyworld_collision.data.episodes import read_attributes
++
++
++MODALITIES = ("pixels", "states")
++
++
++def _h5py() -> Any:
++    import h5py
++
++    return h5py
++
++
++class _LazyHDF5:
++    """Open the HDF5 file on first use in each process (h5py handles cannot be forked)."""
++
++    def __init__(self, path: str | Path, modality: str) -> None:
++        if modality not in MODALITIES:
++            raise ValueError(f"modality must be one of {MODALITIES}, got {modality!r}")
++        self.path = Path(path).expanduser().resolve(strict=True)
++        self.modality = modality
++        self.attributes = read_attributes(self.path)
++        if modality == "pixels" and not bool(self.attributes["has_pixels"]):
++            raise ValueError(f"{self.path} was converted with --states-only")
++        self.key = "grids" if modality == "pixels" else "states"
++        self.num_episodes = int(self.attributes["dataset_length"])
++        self._handle: Any | None = None
++
++    @property
++    def handle(self) -> Any:
++        if self._handle is None:
++            self._handle = _h5py().File(self.path, "r")
++        return self._handle
++
++    def __getstate__(self) -> dict:
++        state = self.__dict__.copy()
++        state["_handle"] = None
++        return state
++
++
++class EpisodeDataset(Dataset):
++    """Episodes as ``(4, S, S, 6)`` uint8 (pixels) or ``(4, 10)`` float32 (states).
++
++    Items are ``(observations, episode_index)`` so evaluation can look up the
++    metadata (delta, collisions, true positions) of each episode.
++    """
++
++    def __init__(self, path: str | Path, modality: str) -> None:
++        self._file = _LazyHDF5(path, modality)
++
++    @property
++    def attributes(self) -> dict:
++        return self._file.attributes
++
++    @property
++    def path(self) -> Path:
++        return self._file.path
++
++    def __len__(self) -> int:
++        return self._file.num_episodes
++
++    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
++        if not 0 <= index < len(self):
++            raise IndexError(index)
++        array = np.asarray(self._file.handle[self._file.key][index])
++        return torch.from_numpy(array), index
++
++
++class ObservationDataset(Dataset):
++    """Every single observation of an episode file, for observation-model pretraining."""
++
++    def __init__(self, path: str | Path, modality: str) -> None:
++        self._file = _LazyHDF5(path, modality)
++
++    @property
++    def attributes(self) -> dict:
++        return self._file.attributes
++
++    @property
++    def path(self) -> Path:
++        return self._file.path
++
++    def __len__(self) -> int:
++        return 4 * self._file.num_episodes
++
++    def __getitem__(self, index: int) -> torch.Tensor:
++        episode, slot = divmod(index, 4)
++        return torch.from_numpy(np.asarray(self._file.handle[self._file.key][episode, slot]))
++
++
++@dataclass(frozen=True, slots=True)
++class EpisodeBatch:
++    """A collated batch: ``observations`` is ``(B, 4, ...)``."""
++
++    observations: torch.Tensor
++    indices: torch.Tensor
++
++    def to(self, device: torch.device | str) -> "EpisodeBatch":
++        return EpisodeBatch(self.observations.to(device, non_blocking=True), self.indices)
++
++    def __len__(self) -> int:
++        return self.observations.shape[0]
++
++
++def collate_episodes(items: Sequence[tuple[torch.Tensor, int]]) -> EpisodeBatch:
++    return EpisodeBatch(
++        observations=torch.stack([item[0] for item in items]),
++        indices=torch.tensor([item[1] for item in items], dtype=torch.long),
++    )
++
++
++@dataclass(frozen=True, slots=True)
++class EpisodeMetadata:
++    """Per-episode ground truth used by the evaluation."""
++
++    delta: np.ndarray  # (N,)
++    collides: np.ndarray  # (N, 2) support, query
++    positions: np.ndarray  # (N, 4, 2, 2, 2)
++    radii: np.ndarray  # (N, 2, 2)
++    init: np.ndarray  # (N, 2, 4)
++
++
++def load_metadata(path: str | Path) -> EpisodeMetadata:
++    with _h5py().File(path, "r") as handle:
++        return EpisodeMetadata(
++            delta=np.asarray(handle["delta"][:], dtype=np.int64),
++            collides=np.asarray(handle["collides"][:], dtype=bool),
++            positions=np.asarray(handle["positions"][:], dtype=np.float64),
++            radii=np.asarray(handle["radii"][:], dtype=np.float64),
++            init=np.asarray(handle["init"][:], dtype=np.float64),
++        )
++
++
++__all__ = [
++    "EpisodeBatch",
++    "EpisodeDataset",
++    "EpisodeMetadata",
++    "MODALITIES",
++    "ObservationDataset",
++    "collate_episodes",
++    "load_metadata",
++]
+diff --git a/src/tasks/phyworld_collision/data/episodes.py b/src/tasks/phyworld_collision/data/episodes.py
+new file mode 100644
+index 0000000..f561295
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/episodes.py
+@@ -0,0 +1,367 @@
++"""Turn collision videos into Learning-to-Theorize episodes.
++
++Task definition ("advance time by delta steps")
++-----------------------------------------------
++* An **observation** at frame ``t`` is two frames, ``t - k`` and ``t``, where
++  ``k = frame_step``.  Two frames make the state Markov: they show positions
++  *and* velocities.  Pixels are stacked on the channel axis, ``(S, S, 6)``;
++  the state version is the 10-number vector of :func:`physics.state_vector`.
++* A **pair** is ``x = obs(t)`` and ``y = obs(t + delta * k)``.
++* An **episode** is a support pair from video A and a query pair from a
++  different video B with the **same delta**.  NEO infers a program on the
++  support pair and must reuse it on the query pair, so the only thing the
++  two pairs share is "advance time by delta steps": the physics.
++
++Episode file layout (one HDF5 per split)
++----------------------------------------
++Root attributes: ``format``, ``dataset_length``, ``image_size``,
++``frame_step``, ``deltas``, ``has_pixels``, ``source``, ``split``.
++
++==================  ======================  ==========================================
++dataset             shape / dtype           meaning
++==================  ======================  ==========================================
++grids               (N, 4, S, S, 6) uint8   x_support, y_support, x_query, y_query
++states              (N, 4, 10) float32      same four observations as state vectors
++positions           (N, 4, 2, 2, 2) f32     true positions: obs, frame (t-k, t), ball, xy
++radii               (N, 2, 2) f32           support/query video, ball
++init                (N, 2, 4) f32           r1, r2, v1, v2 of the support/query video
++delta               (N,) int16              steps advanced (frames = delta * frame_step)
++collides            (N, 2) bool             contact inside the support/query window
++video_index         (N, 2) int64            global video index in the source file
++start_frame         (N, 2) int16            t of the support/query input observation
++==================  ======================  ==========================================
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Callable
++
++import numpy as np
++
++from tasks.phyworld_collision.physics import (
++    ID_RADIUS_RANGE,
++    ID_VELOCITY_RANGE,
++    STATE_DIM,
++    collision_frame,
++    render_frames,
++    state_vector,
++    window_contains_collision,
++)
++
++
++FORMAT = "l2t-phyworld-collision-episodes-v1"
++CHANNELS = 6
++OBSERVATIONS_PER_EPISODE = 4
++
++
++# ---------------------------------------------------------------------------
++# Video selection
++# ---------------------------------------------------------------------------
++
++
++def classify_videos(init: np.ndarray, *, tol: float = 1e-6) -> np.ndarray:
++    """Label each ``(r1, r2, v1, v2)`` row as id / ood-velocity / ood-radius / ood-both."""
++
++    init = np.asarray(init, dtype=np.float64)
++    v_ok = np.all(
++        (init[:, 2:] >= ID_VELOCITY_RANGE[0] - tol) & (init[:, 2:] <= ID_VELOCITY_RANGE[1] + tol),
++        axis=1,
++    )
++    r_ok = np.all(
++        (init[:, :2] >= ID_RADIUS_RANGE[0] - tol) & (init[:, :2] <= ID_RADIUS_RANGE[1] + tol),
++        axis=1,
++    )
++    labels = np.full(len(init), "ood-both", dtype=object)
++    labels[v_ok & r_ok] = "id"
++    labels[~v_ok & r_ok] = "ood-velocity"
++    labels[v_ok & ~r_ok] = "ood-radius"
++    return labels
++
++
++FILTERS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
++    "all": lambda labels: np.ones(len(labels), dtype=bool),
++    "id": lambda labels: labels == "id",
++    "ood": lambda labels: labels != "id",
++    "ood-velocity": lambda labels: labels == "ood-velocity",
++    "ood-radius": lambda labels: labels == "ood-radius",
++}
++
++
++def video_split_mask(
++    num_videos: int, which: str, *, test_fraction: float, split_seed: int
++) -> np.ndarray:
++    """Deterministic train/test split *by video*, so test videos are never trained on."""
++
++    if which == "all":
++        return np.ones(num_videos, dtype=bool)
++    order = np.random.default_rng(split_seed).permutation(num_videos)
++    is_test = np.zeros(num_videos, dtype=bool)
++    is_test[order[: int(round(test_fraction * num_videos))]] = True
++    if which == "test":
++        return is_test
++    if which == "train":
++        return ~is_test
++    raise ValueError(f"unknown video split {which!r}")
++
++
++# ---------------------------------------------------------------------------
++# Windows
++# ---------------------------------------------------------------------------
++
++
++def valid_start_range(delta: int, frame_step: int, num_frames: int) -> tuple[int, int]:
++    """Inclusive range of input frames ``t`` with room for ``t - k`` and ``t + delta * k``."""
++
++    low = frame_step
++    high = num_frames - 1 - delta * frame_step
++    if high < low:
++        raise ValueError(
++            f"delta={delta} with frame_step={frame_step} does not fit in {num_frames} frames"
++        )
++    return low, high
++
++
++def sample_start(
++    rng: np.random.Generator,
++    *,
++    delta: int,
++    frame_step: int,
++    num_frames: int,
++    contact: int,
++    want_collision: bool | None,
++) -> int:
++    """Pick the input frame ``t``; optionally force the window to (not) contain the contact.
++
++    The window spans frames ``[t - k, t + delta * k]``.  If the requested
++    condition cannot be met for this video, a uniform start is returned.
++    """
++
++    low, high = valid_start_range(delta, frame_step, num_frames)
++    starts = np.arange(low, high + 1)
++    if want_collision is not None:
++        inside = np.array(
++            [
++                window_contains_collision(contact, t - frame_step, t + delta * frame_step)
++                for t in starts
++            ]
++        )
++        candidates = starts[inside] if want_collision else starts[~inside]
++        if candidates.size:
++            starts = candidates
++    return int(rng.choice(starts))
++
++
++# ---------------------------------------------------------------------------
++# Observations
++# ---------------------------------------------------------------------------
++
++
++def pixel_observation(frames: np.ndarray, t: int, frame_step: int) -> np.ndarray:
++    """``(S, S, 6)`` uint8: frame ``t - k`` in channels 0-2, frame ``t`` in 3-5."""
++
++    return np.concatenate([frames[t - frame_step], frames[t]], axis=-1)
++
++
++@dataclass(slots=True)
++class EpisodeRecord:
++    """One episode before it is written (all four observations)."""
++
++    grids: np.ndarray | None
++    states: np.ndarray
++    positions: np.ndarray
++    radii: np.ndarray
++    init: np.ndarray
++    delta: int
++    collides: np.ndarray
++    video_index: np.ndarray
++    start_frame: np.ndarray
++
++
++FrameSource = Callable[[int, np.ndarray], np.ndarray]
++"""``(local_video_index, frame_indices) -> (len(frame_indices), S, S, 3)`` uint8."""
++
++
++def rendered_frame_source(positions: np.ndarray, radii: np.ndarray, image_size: int) -> FrameSource:
++    """Render frames from stored positions (fast, no MP4 artefacts)."""
++
++    def source(video: int, frame_indices: np.ndarray) -> np.ndarray:
++        return render_frames(positions[video, frame_indices], radii[video], image_size)
++
++    return source
++
++
++def build_episode(
++    rng: np.random.Generator,
++    *,
++    support_video: int,
++    query_video: int,
++    delta: int,
++    frame_step: int,
++    positions: np.ndarray,
++    init: np.ndarray,
++    first_index: int,
++    frame_source: FrameSource | None,
++    collision_fraction: float | None,
++) -> EpisodeRecord:
++    """Assemble one support/query episode from two videos of the same chunk."""
++
++    num_frames = positions.shape[1]
++    videos = (support_video, query_video)
++    grids, states, true_positions, starts, collides = [], [], [], [], []
++    for video in videos:
++        contact = collision_frame(positions[video], init[video, :2])
++        want = None
++        if collision_fraction is not None:
++            want = bool(rng.random() < collision_fraction)
++        t = sample_start(
++            rng,
++            delta=delta,
++            frame_step=frame_step,
++            num_frames=num_frames,
++            contact=contact,
++            want_collision=want,
++        )
++        t_out = t + delta * frame_step
++        starts.append(t)
++        collides.append(window_contains_collision(contact, t - frame_step, t_out))
++        for end in (t, t_out):
++            states.append(state_vector(positions[video], init[video, :2], end, frame_step))
++            true_positions.append(positions[video, [end - frame_step, end]])
++        if frame_source is not None:
++            needed = np.array([t - frame_step, t, t_out - frame_step, t_out])
++            frames = frame_source(video, needed)
++            grids.append(np.concatenate([frames[0], frames[1]], axis=-1))
++            grids.append(np.concatenate([frames[2], frames[3]], axis=-1))
++    return EpisodeRecord(
++        grids=np.stack(grids).astype(np.uint8) if frame_source is not None else None,
++        states=np.stack(states).astype(np.float32),
++        positions=np.stack(true_positions).astype(np.float32),
++        radii=init[list(videos), :2].astype(np.float32),
++        init=init[list(videos)].astype(np.float32),
++        delta=int(delta),
++        collides=np.asarray(collides, dtype=bool),
++        video_index=np.asarray([first_index + v for v in videos], dtype=np.int64),
++        start_frame=np.asarray(starts, dtype=np.int16),
++    )
++
++
++# ---------------------------------------------------------------------------
++# HDF5 I/O
++# ---------------------------------------------------------------------------
++
++
++def _h5py() -> Any:
++    try:
++        import h5py
++    except ImportError as error:  # pragma: no cover - environment dependent
++        raise RuntimeError("h5py is required to write episode files") from error
++    return h5py
++
++
++@dataclass
++class EpisodeWriter:
++    """Append episodes to a new HDF5 file (see the module docstring for the layout)."""
++
++    path: Path
++    capacity: int
++    image_size: int
++    frame_step: int
++    deltas: tuple[int, ...]
++    has_pixels: bool
++    attributes: dict[str, Any] = field(default_factory=dict)
++    compression_level: int = 4
++
++    def __post_init__(self) -> None:
++        h5py = _h5py()
++        self.path = Path(self.path)
++        if self.path.exists():
++            raise FileExistsError(f"refusing to overwrite {self.path}")
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self._file = h5py.File(self.path, "w")
++        n, s = self.capacity, self.image_size
++        create = self._file.create_dataset
++        if self.has_pixels:
++            create(
++                "grids",
++                shape=(n, 4, s, s, CHANNELS),
++                maxshape=(None, 4, s, s, CHANNELS),
++                dtype=np.uint8,
++                chunks=(1, 4, s, s, CHANNELS),
++                compression="gzip",
++                compression_opts=self.compression_level,
++            )
++        create("states", shape=(n, 4, STATE_DIM), maxshape=(None, 4, STATE_DIM), dtype=np.float32)
++        create("positions", shape=(n, 4, 2, 2, 2), maxshape=(None, 4, 2, 2, 2), dtype=np.float32)
++        create("radii", shape=(n, 2, 2), maxshape=(None, 2, 2), dtype=np.float32)
++        create("init", shape=(n, 2, 4), maxshape=(None, 2, 4), dtype=np.float32)
++        create("delta", shape=(n,), maxshape=(None,), dtype=np.int16)
++        create("collides", shape=(n, 2), maxshape=(None, 2), dtype=bool)
++        create("video_index", shape=(n, 2), maxshape=(None, 2), dtype=np.int64)
++        create("start_frame", shape=(n, 2), maxshape=(None, 2), dtype=np.int16)
++        self.count = 0
++
++    def append(self, record: EpisodeRecord) -> None:
++        if self.count >= self.capacity:
++            raise RuntimeError("episode writer is full")
++        i = self.count
++        if self.has_pixels:
++            if record.grids is None:
++                raise ValueError("pixel episode file needs grids")
++            self._file["grids"][i] = record.grids
++        self._file["states"][i] = record.states
++        self._file["positions"][i] = record.positions
++        self._file["radii"][i] = record.radii
++        self._file["init"][i] = record.init
++        self._file["delta"][i] = record.delta
++        self._file["collides"][i] = record.collides
++        self._file["video_index"][i] = record.video_index
++        self._file["start_frame"][i] = record.start_frame
++        self.count += 1
++
++    def close(self) -> None:
++        if self._file is None:
++            return
++        for name in list(self._file.keys()):
++            self._file[name].resize(self.count, axis=0)
++        attrs = self._file.attrs
++        attrs["format"] = FORMAT
++        attrs["dataset_length"] = self.count
++        attrs["image_size"] = self.image_size
++        attrs["frame_step"] = self.frame_step
++        attrs["deltas"] = np.asarray(self.deltas, dtype=np.int64)
++        attrs["has_pixels"] = self.has_pixels
++        attrs["state_dim"] = STATE_DIM
++        for key, value in self.attributes.items():
++            attrs[key] = value
++        self._file.close()
++        self._file = None
++
++
++def read_attributes(path: str | Path) -> dict[str, Any]:
++    """Root attributes of an episode file, validated."""
++
++    h5py = _h5py()
++    with h5py.File(path, "r") as handle:
++        attrs = {key: handle.attrs[key] for key in handle.attrs}
++    if attrs.get("format") != FORMAT:
++        raise ValueError(f"{path} is not a {FORMAT} file (format={attrs.get('format')!r})")
++    return attrs
++
++
++__all__ = [
++    "CHANNELS",
++    "EpisodeRecord",
++    "EpisodeWriter",
++    "FILTERS",
++    "FORMAT",
++    "build_episode",
++    "classify_videos",
++    "pixel_observation",
++    "read_attributes",
++    "rendered_frame_source",
++    "sample_start",
++    "valid_start_range",
++    "video_split_mask",
++]
+diff --git a/src/tasks/phyworld_collision/data/phyworld_hdf5.py b/src/tasks/phyworld_collision/data/phyworld_hdf5.py
+new file mode 100644
+index 0000000..d89b24a
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/phyworld_hdf5.py
+@@ -0,0 +1,258 @@
++"""Read (and write) PhyWorld collision HDF5 files.
++
++PhyWorld's generator merges per-chunk files into one HDF5 with three groups,
++each holding one dataset per chunk of up to 1000 videos::
++
++    video_streams/<chunk>     vlen uint8, one MP4 byte stream per video
++    position_streams/<chunk>  float  (N, 32, 2, 2)   frame, ball, xy (world units)
++    init_streams/<chunk>      float  (N, 4)          r1, r2, v1, v2
++
++The released files on Hugging Face (``magicr/phyworld``) are not documented
++beyond this, so the reader also accepts the three names as plain datasets and
++finds them in nested groups (e.g. one group per OOD level).  Run
++``python -m tasks.phyworld_collision.data.phyworld_hdf5 FILE`` to print the
++layout of a file before converting it.
++"""
++
++from __future__ import annotations
++
++import argparse
++from dataclasses import dataclass
++from io import BytesIO
++from pathlib import Path
++from typing import Any, Iterator, Sequence
++
++import numpy as np
++
++from tasks.phyworld_collision.physics import NUM_FRAMES, render_frames
++
++
++POSITIONS = "position_streams"
++INIT = "init_streams"
++VIDEOS = "video_streams"
++
++
++def _h5py() -> Any:
++    try:
++        import h5py
++    except ImportError as error:  # pragma: no cover - environment dependent
++        raise RuntimeError("h5py is required to read PhyWorld files") from error
++    return h5py
++
++
++@dataclass(frozen=True, slots=True)
++class Chunk:
++    """One block of videos from a PhyWorld file, loaded into memory."""
++
++    collection: str
++    name: str
++    first_index: int  # global index of the first video in this chunk
++    positions: np.ndarray  # (N, T, 2, 2) float64
++    init: np.ndarray  # (N, 4) float64: r1, r2, v1, v2
++    has_video: bool
++
++    def __len__(self) -> int:
++        return self.positions.shape[0]
++
++    @property
++    def radii(self) -> np.ndarray:
++        return self.init[:, :2]
++
++
++def _collections(handle: Any) -> list[str]:
++    """Paths of groups that contain both ``position_streams`` and ``init_streams``."""
++
++    found: list[str] = []
++
++    def visit(path: str, group: Any) -> None:
++        if POSITIONS in group and INIT in group:
++            found.append(path)
++            return
++        for key in sorted(group.keys()):
++            item = group[key]
++            if hasattr(item, "keys"):
++                visit(f"{path}/{key}" if path else key, item)
++
++    visit("", handle)
++    if not found:
++        raise ValueError(
++            f"no group with {POSITIONS!r} and {INIT!r} found; run the inspector "
++            "(python -m tasks.phyworld_collision.data.phyworld_hdf5 FILE) to see the layout"
++        )
++    return found
++
++
++def _chunk_names(node: Any) -> list[str | None]:
++    """Chunk dataset names of a stream group, or ``[None]`` for a plain dataset."""
++
++    if hasattr(node, "keys"):
++        return sorted(node.keys())
++    return [None]
++
++
++def _read(node: Any, name: str | None) -> Any:
++    return node if name is None else node[name]
++
++
++class PhyWorldCollisionFile:
++    """Iterate over the videos of one PhyWorld collision file, chunk by chunk."""
++
++    def __init__(self, path: str | Path) -> None:
++        self.path = Path(path).expanduser().resolve(strict=True)
++        h5py = _h5py()
++        self._handle = h5py.File(self.path, "r")
++        self.collections = _collections(self._handle)
++        self._index: list[tuple[str, str | None, int, int]] = []
++        total = 0
++        for collection in self.collections:
++            group = self._handle[collection] if collection else self._handle
++            for name in _chunk_names(group[POSITIONS]):
++                count = int(_read(group[POSITIONS], name).shape[0])
++                self._index.append((collection, name, total, count))
++                total += count
++        self.num_videos = total
++
++    def close(self) -> None:
++        self._handle.close()
++
++    def __enter__(self) -> "PhyWorldCollisionFile":
++        return self
++
++    def __exit__(self, *_: object) -> None:
++        self.close()
++
++    def chunks(self) -> Iterator[Chunk]:
++        for collection, name, first, _ in self._index:
++            group = self._handle[collection] if collection else self._handle
++            positions = np.asarray(_read(group[POSITIONS], name), dtype=np.float64)
++            init = np.asarray(_read(group[INIT], name), dtype=np.float64)
++            if positions.ndim != 4 or positions.shape[2:] != (2, 2):
++                raise ValueError(
++                    f"{collection}/{POSITIONS}/{name}: expected (N, T, 2, 2), got {positions.shape}"
++                )
++            if init.shape != (positions.shape[0], 4):
++                raise ValueError(
++                    f"{collection}/{INIT}/{name}: expected ({positions.shape[0]}, 4), got {init.shape}"
++                )
++            yield Chunk(
++                collection=collection,
++                name=name or "",
++                first_index=first,
++                positions=positions,
++                init=init,
++                has_video=VIDEOS in group,
++            )
++
++    def video_bytes(self, chunk: Chunk, index: int) -> bytes:
++        group = self._handle[chunk.collection] if chunk.collection else self._handle
++        if VIDEOS not in group:
++            raise ValueError(f"{self.path} has no {VIDEOS}; use --render positions")
++        stream = _read(group[VIDEOS], chunk.name or None)[index]
++        return np.asarray(stream, dtype=np.uint8).tobytes()
++
++    def decode_video(self, chunk: Chunk, index: int) -> np.ndarray:
++        """Decode one MP4 into ``(T, H, W, 3)`` uint8 frames."""
++
++        import imageio.v3 as iio
++
++        frames = iio.imread(self.video_bytes(chunk, index), extension=".mp4")
++        return np.asarray(frames)[..., :3]
++
++
++# ---------------------------------------------------------------------------
++# Writing PhyWorld-format files (used by the simulator)
++# ---------------------------------------------------------------------------
++
++
++def encode_mp4(frames: np.ndarray, fps: int = 5) -> np.ndarray:
++    """Encode frames to an MP4 byte stream like PhyWorld (needs imageio-ffmpeg)."""
++
++    import imageio.v3 as iio
++
++    with BytesIO() as buffer:
++        iio.imwrite(buffer, frames, extension=".mp4", fps=fps)
++        return np.frombuffer(buffer.getvalue(), dtype=np.uint8)
++
++
++def write_phyworld_file(
++    path: str | Path,
++    positions: np.ndarray,
++    init: np.ndarray,
++    *,
++    chunk_size: int = 1000,
++    with_video: bool = False,
++    video_size: int = 256,
++) -> None:
++    """Write videos in PhyWorld's merged layout (groups of chunk datasets)."""
++
++    h5py = _h5py()
++    path = Path(path)
++    if path.exists():
++        raise FileExistsError(f"refusing to overwrite {path}")
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with h5py.File(path, "w") as handle:
++        groups = {key: handle.create_group(key) for key in (POSITIONS, INIT)}
++        if with_video:
++            groups[VIDEOS] = handle.create_group(VIDEOS)
++        for chunk_id, start in enumerate(range(0, len(positions), chunk_size)):
++            stop = min(start + chunk_size, len(positions))
++            name = f"{chunk_id:05d}"
++            groups[POSITIONS].create_dataset(name, data=positions[start:stop])
++            groups[INIT].create_dataset(name, data=init[start:stop])
++            if with_video:
++                dataset = groups[VIDEOS].create_dataset(
++                    name, shape=(stop - start,), dtype=h5py.vlen_dtype(np.dtype("uint8"))
++                )
++                for offset, index in enumerate(range(start, stop)):
++                    frames = render_frames(positions[index], init[index, :2], video_size)
++                    dataset[offset] = encode_mp4(frames)
++
++
++# ---------------------------------------------------------------------------
++# Inspector
++# ---------------------------------------------------------------------------
++
++
++def describe(path: str | Path, *, max_items: int = 6) -> str:
++    """Human-readable tree of an HDF5 file (first few items per group)."""
++
++    h5py = _h5py()
++    lines: list[str] = []
++
++    def visit(name: str, node: Any, depth: int) -> None:
++        indent = "  " * depth
++        if hasattr(node, "keys"):
++            keys = sorted(node.keys())
++            lines.append(f"{indent}{name or '/'}/  ({len(keys)} items)")
++            for key in keys[:max_items]:
++                visit(key, node[key], depth + 1)
++            if len(keys) > max_items:
++                lines.append(f"{indent}  ... {len(keys) - max_items} more")
++        else:
++            lines.append(f"{indent}{name}  shape={node.shape} dtype={node.dtype}")
++
++    with h5py.File(path, "r") as handle:
++        visit("", handle, 0)
++        for key, value in handle.attrs.items():
++            lines.append(f"attr {key} = {value!r}")
++    return "\n".join(lines)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description="Print the layout of a PhyWorld HDF5 file")
++    parser.add_argument("path", type=Path)
++    parser.add_argument("--max-items", type=int, default=6)
++    arguments = parser.parse_args(argv)
++    print(describe(arguments.path, max_items=arguments.max_items))
++    with PhyWorldCollisionFile(arguments.path) as source:
++        print(f"\ncollections: {source.collections or ['/']}")
++        print(f"videos: {source.num_videos}")
++        chunk = next(source.chunks())
++        print(f"first chunk: {chunk.collection}/{chunk.name} ({len(chunk)} videos), "
++              f"frames per video: {chunk.positions.shape[1]} (expected {NUM_FRAMES})")
++        print(f"init (r1, r2, v1, v2) of first 3 videos:\n{chunk.init[:3]}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/data/simulate.py b/src/tasks/phyworld_collision/data/simulate.py
+new file mode 100644
+index 0000000..0001bfa
+--- /dev/null
++++ b/src/tasks/phyworld_collision/data/simulate.py
+@@ -0,0 +1,132 @@
++"""Generate PhyWorld-format collision files without Box2D.
++
++Useful for (a) a quick smoke test before downloading the real data and
++(b) building OOD evaluation sets with exactly the ranges you want.  The
++parameter grids follow PhyWorld's ``two_balls_collision.py``:
++
++* ``id-30k``: v1, v2 on 21 values in [1, 4]; r1, r2 on 8 values in [0.5, 1.5]
++  (28,224 combinations, the "30K" training set);
++* ``id-eval``: 15 random speeds and 5 random radii in the ID ranges;
++* ``ood-velocity-low`` / ``ood-velocity-high``: one or both speeds in
++  [0, 0.8] / [4.5, 6.0], radii in distribution (PhyWorld levels 2 and 4);
++* ``ood-radius-low`` / ``ood-radius-high``: one or both radii in
++  [0.3, 0.4] / [1.7, 2.0], speeds in distribution (levels 1 and 3);
++* ``tiny``: 4 speeds x 3 radii, for tests.
++
++The motion is the closed-form 1D collision of :mod:`..physics`; contacts
++slower than Box2D's 1 unit/s velocity threshold are inelastic, as in Box2D.
++
++Example::
++
++    python -m tasks.phyworld_collision.data.simulate --preset ood-velocity-high \\
++        --output data/phyworld/collision_ood_velocity_high.hdf5
++"""
++
++from __future__ import annotations
++
++import argparse
++import itertools
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++
++from tasks.phyworld_collision.data.phyworld_hdf5 import write_phyworld_file
++from tasks.phyworld_collision.physics import (
++    ID_RADIUS_RANGE,
++    ID_VELOCITY_RANGE,
++    sample_initial_positions,
++    simulate_collision,
++)
++
++
++def _grid(r1s, r2s, v1s, v2s) -> list[tuple[float, float, float, float]]:
++    return [tuple(map(float, c)) for c in itertools.product(r1s, r2s, v1s, v2s)]
++
++
++def preset_combinations(name: str, rng: np.random.Generator) -> list[tuple[float, float, float, float]]:
++    """``(r1, r2, v1, v2)`` combinations of a named preset."""
++
++    v_lo, v_hi = ID_VELOCITY_RANGE
++    r_lo, r_hi = ID_RADIUS_RANGE
++    v_id = np.linspace(v_lo, v_hi, 16)[::2]
++    r_id = np.linspace(r_lo, r_hi, 6)
++    if name == "id-30k":
++        v, r = np.linspace(v_lo, v_hi, 21), np.linspace(r_lo, r_hi, 8)
++        return _grid(r, r, v, v)
++    if name == "id-eval":
++        v = np.sort(rng.uniform(v_lo, v_hi, 15))
++        r = np.sort(rng.uniform(r_lo, r_hi, 5))
++        return _grid(r, r, v, v)
++    if name in ("ood-velocity-low", "ood-velocity-high"):
++        v_ood = np.linspace(0.0, 0.8, 11) if name.endswith("low") else np.linspace(4.5, 6.0, 6)
++        return _grid(r_id, r_id, v_ood, v_id) + _grid(r_id, r_id, v_ood, v_ood)
++    if name in ("ood-radius-low", "ood-radius-high"):
++        r_ood = np.linspace(0.3, 0.4, 11) if name.endswith("low") else np.linspace(1.7, 2.0, 6)
++        return _grid(r_ood, r_id, v_id, v_id) + _grid(r_ood, r_ood, v_id, v_id)
++    if name == "tiny":
++        v, r = np.linspace(v_lo, v_hi, 4), np.linspace(r_lo, r_hi, 3)
++        return _grid(r, r, v, v)
++    raise ValueError(f"unknown preset {name!r}")
++
++
++PRESETS = (
++    "id-30k",
++    "id-eval",
++    "ood-velocity-low",
++    "ood-velocity-high",
++    "ood-radius-low",
++    "ood-radius-high",
++    "tiny",
++)
++
++
++def simulate_videos(
++    combinations: Sequence[tuple[float, float, float, float]],
++    rng: np.random.Generator,
++) -> tuple[np.ndarray, np.ndarray]:
++    """Simulate each combination; drops scenes PhyWorld would also drop."""
++
++    positions, init = [], []
++    for r1, r2, v1, v2 in combinations:
++        placement = sample_initial_positions(r1, r2, v1, v2, rng)
++        if placement is None:
++            continue
++        x1, x2, height = placement
++        positions.append(simulate_collision(r1, r2, v1, v2, x1, x2, height))
++        init.append((r1, r2, v1, v2))
++    if not positions:
++        raise RuntimeError("no scene could be placed")
++    return np.stack(positions), np.asarray(init, dtype=np.float64)
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--preset", choices=PRESETS, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--max-videos", type=int, help="random subset of the preset's combinations")
++    parser.add_argument("--with-video", action="store_true", help="also store 256x256 MP4s (needs imageio-ffmpeg)")
++    parser.add_argument("--chunk-size", type=int, default=1000)
++    parser.add_argument("--seed", type=int, default=42)
++    arguments = parser.parse_args(argv)
++
++    rng = np.random.default_rng(arguments.seed)
++    combinations = preset_combinations(arguments.preset, rng)
++    order = rng.permutation(len(combinations))
++    if arguments.max_videos is not None:
++        order = order[: arguments.max_videos]
++    combinations = [combinations[i] for i in order]
++    positions, init = simulate_videos(combinations, rng)
++    write_phyworld_file(
++        arguments.output,
++        positions,
++        init,
++        chunk_size=arguments.chunk_size,
++        with_video=arguments.with_video,
++    )
++    print(f"wrote {len(positions)} videos ({arguments.preset}) to {arguments.output}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/evaluation.py b/src/tasks/phyworld_collision/evaluation.py
+new file mode 100644
+index 0000000..f31a53d
+--- /dev/null
++++ b/src/tasks/phyworld_collision/evaluation.py
+@@ -0,0 +1,310 @@
++"""Evaluate a trained NEO on any number of episode files.
++
++::
++
++    python -m tasks.phyworld_collision.evaluation \\
++        --checkpoint runs/collision/neo/.../checkpoints/best.pt \\
++        --split id=data/collision/id_test.h5 \\
++        --split length_ood=data/collision/length_ood.h5 \\
++        --split velocity_ood=data/collision/velocity_ood.h5 \\
++        --output-dir runs/collision/eval
++
++For each split the program is inferred on the **support** pair (including its
++length, chosen by MDL) and executed on the **query** pair.  Reported:
++
++* ``query_loss`` / ``query_foreground_l1``: image (or state) error of the
++  transferred program, the L2T metric;
++* ``length_matches_delta``: how often the selected program length equals the
++  number of steps ``delta`` (did NEO learn "one primitive = one step"?);
++* physics errors of the query prediction in world units: ball **position**
++  at the last frame and ball **velocity**, measured by tracking the red and
++  blue balls (pixels) or read off the state vector (states).  Balls that are
++  not fully inside the target frame are excluded;
++* two reference predictors on the same episodes: ``copy`` (nothing moves) and
++  ``constant_velocity`` (true input positions extrapolated, no collision);
++* everything split by whether the query window contains the contact and by
++  ``delta``, plus which codebook entries the programs use.
++
++The number of program steps defaults to ``max(max_transition_length, largest
++delta in the split)`` so length-OOD splits can use longer programs.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from collections import Counter
++from pathlib import Path
++from typing import Any, Sequence
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader
++
++from tasks.phyworld_collision.data.dataset import EpisodeDataset, collate_episodes, load_metadata
++from tasks.phyworld_collision.physics import (
++    FRAME_DT,
++    WORLD_SCALE,
++    ball_centroids,
++    state_to_physical,
++)
++from tasks.phyworld_collision.task import load_neo_checkpoint
++from tasks.phyworld_collision.visualize import save_rows
++from training.runtime import bfloat16_autocast
++
++
++def _fully_inside(positions: np.ndarray, radii: np.ndarray) -> np.ndarray:
++    """``positions`` (N, 2, 2) and ``radii`` (N, 2) -> (N, 2) bool."""
++
++    low = positions - radii[..., None]
++    high = positions + radii[..., None]
++    return np.all((low >= 0.0) & (high <= WORLD_SCALE), axis=-1)
++
++
++def physics_from_pixels(observations: np.ndarray, frame_step: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    """Tracked last-frame centres, velocities and visibility from ``(N, S, S, 6)``."""
++
++    earlier = ball_centroids(observations[..., :3])
++    later = ball_centroids(observations[..., 3:6])
++    velocity = (later.centers - earlier.centers) / (frame_step * FRAME_DT)
++    return later.centers, velocity, earlier.visible & later.visible
++
++
++def physics_from_states(states: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
++    values = state_to_physical(states)
++    visible = np.ones(values["position"].shape[:2], dtype=bool)
++    return values["position"], values["velocity"], visible
++
++
++def _summary(values: np.ndarray, mask: np.ndarray) -> float | None:
++    selected = values[mask]
++    selected = selected[np.isfinite(selected)]
++    return float(selected.mean()) if selected.size else None
++
++
++@torch.no_grad()
++def evaluate_split(
++    model,
++    path: Path,
++    *,
++    batch_size: int,
++    num_transitions: int | None,
++    device: torch.device,
++    visualize: int,
++    output_dir: Path,
++    name: str,
++) -> dict[str, Any]:
++    observation = model.observation_config
++    training = model.experiment.training
++    dataset = EpisodeDataset(path, observation.modality)
++    metadata = load_metadata(path)
++    frame_step = int(dataset.attributes["frame_step"])
++    transitions = num_transitions or max(training.max_transition_length, int(metadata.delta.max()))
++    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_episodes)
++    objective = model.objective
++    coefficient = training.length_control_end
++
++    per_episode: dict[str, list[np.ndarray]] = {
++        k: [] for k in ("index", "support_loss", "query_loss", "length", "codes", "pred_pos", "pred_vel", "pred_visible")
++    }
++    examples: list[list[np.ndarray]] = []
++    for batch in loader:
++        batch = batch.to(device)
++        with bfloat16_autocast(device):
++            output = model(
++                batch.observations,
++                is_eval=True,
++                length_control_coefficient=coefficient,
++                num_transitions=transitions,
++            )
++        inputs, targets = objective.split_batch(batch.observations)
++        predictions = output.predictions.float()
++        per_episode["index"].append(batch.indices.numpy())
++        per_episode["support_loss"].append(
++            objective.per_sample_reconstruction_loss(predictions[::2], targets[::2]).float().cpu().numpy()
++        )
++        per_episode["query_loss"].append(
++            objective.per_sample_reconstruction_loss(predictions[1::2], targets[1::2]).float().cpu().numpy()
++        )
++        per_episode["length"].append(output.selected_lengths[::2].cpu().numpy())
++        per_episode["codes"].append(
++            torch.stack([step.indices[::2] for step in output.action_vq_by_length], dim=1).cpu().numpy()
++        )
++        query_prediction = objective.decode_prediction(predictions[1::2]).float().cpu().numpy()
++        if observation.modality == "pixels":
++            position, velocity, visible = physics_from_pixels(query_prediction, frame_step)
++        else:
++            position, velocity, visible = physics_from_states(query_prediction)
++        per_episode["pred_pos"].append(position)
++        per_episode["pred_vel"].append(velocity)
++        per_episode["pred_visible"].append(visible)
++        if observation.modality == "pixels" and len(examples) < visualize:
++            observations = batch.observations.cpu().numpy()
++            support_prediction = objective.decode_prediction(predictions[::2]).float().cpu().numpy()
++            for i in range(min(visualize - len(examples), len(batch))):
++                examples.append(
++                    [
++                        observations[i, 0],
++                        observations[i, 1],
++                        support_prediction[i],
++                        observations[i, 2],
++                        observations[i, 3],
++                        query_prediction[i],
++                    ]
++                )
++
++    data = {k: np.concatenate(v) for k, v in per_episode.items()}
++    order = np.argsort(data["index"])
++    data = {k: v[order] for k, v in data.items()}
++
++    # Ground truth for the query pair (slot 2 = input, slot 3 = target).
++    true_in = metadata.positions[:, 2]  # (N, frame, ball, xy)
++    true_out = metadata.positions[:, 3]
++    query_radii = metadata.radii[:, 1]
++    step_time = frame_step * FRAME_DT
++    true_pos = true_out[:, 1]
++    true_vel = (true_out[:, 1] - true_out[:, 0]) / step_time
++    trackable = _fully_inside(true_out[:, 0], query_radii) & _fully_inside(true_out[:, 1], query_radii)
++    detected = data["pred_visible"] & trackable
++
++    elapsed = (metadata.delta * frame_step * FRAME_DT)[:, None, None]
++    input_vel = (true_in[:, 1] - true_in[:, 0]) / step_time
++    baselines = {
++        "copy": (true_in[:, 1], input_vel),
++        "constant_velocity": (true_in[:, 1] + input_vel * elapsed, input_vel),
++    }
++
++    def errors(position: np.ndarray, velocity: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++        return (
++            np.linalg.norm(position - true_pos, axis=-1),
++            np.linalg.norm(velocity - true_vel, axis=-1),
++        )
++
++    model_pos_err, model_vel_err = errors(data["pred_pos"], data["pred_vel"])
++    baseline_errors = {key: errors(*value) for key, value in baselines.items()}
++
++    def block(mask_episode: np.ndarray) -> dict[str, Any]:
++        ball_mask = trackable & mask_episode[:, None]
++        model_mask = detected & mask_episode[:, None]
++        result = {
++            "episodes": int(mask_episode.sum()),
++            "query_loss": _summary(data["query_loss"], mask_episode),
++            "support_loss": _summary(data["support_loss"], mask_episode),
++            "length_matches_delta": _summary(
++                (data["length"] == metadata.delta).astype(float), mask_episode
++            ),
++            "mean_selected_length": _summary(data["length"].astype(float), mask_episode),
++            "ball_detection_rate": float(model_mask.sum() / max(ball_mask.sum(), 1)),
++            "position_error": _summary(model_pos_err, model_mask),
++            "velocity_error": _summary(model_vel_err, model_mask),
++        }
++        for key, (pos_err, vel_err) in baseline_errors.items():
++            result[f"{key}_position_error"] = _summary(pos_err, ball_mask)
++            result[f"{key}_velocity_error"] = _summary(vel_err, ball_mask)
++        return result
++
++    everything = np.ones(len(metadata.delta), dtype=bool)
++    collides = metadata.collides[:, 1]
++    report: dict[str, Any] = {
++        "split": name,
++        "path": str(path),
++        "num_transitions": transitions,
++        "frame_step": frame_step,
++        "all": block(everything),
++        "query_window_with_collision": block(collides),
++        "query_window_without_collision": block(~collides),
++        "by_delta": {int(d): block(metadata.delta == d) for d in np.unique(metadata.delta)},
++    }
++
++    programs = [
++        "-".join(str(c) for c in codes[:length]) for codes, length in zip(data["codes"], data["length"])
++    ]
++    report["programs"] = {
++        "most_common": Counter(programs).most_common(15),
++        "with_collision": Counter(p for p, c in zip(programs, collides) if c).most_common(8),
++        "without_collision": Counter(p for p, c in zip(programs, collides) if not c).most_common(8),
++        "by_delta": {
++            int(d): Counter(p for p, dd in zip(programs, metadata.delta) if dd == d).most_common(5)
++            for d in np.unique(metadata.delta)
++        },
++    }
++    first_codes = data["codes"][:, 0]
++    report["codebook_usage_first_step"] = {
++        int(c): int(n) for c, n in zip(*np.unique(first_codes, return_counts=True))
++    }
++
++    if examples:
++        save_rows(output_dir / f"{name}_examples.png", examples)
++        report["examples_png"] = str(output_dir / f"{name}_examples.png")
++        report["examples_columns"] = [
++            "support x", "support y", "support prediction", "query x", "query y", "query prediction"
++        ]
++    return report
++
++
++def _parse_split(text: str) -> tuple[str, Path]:
++    name, separator, path = text.partition("=")
++    if not separator or not name or not path:
++        raise argparse.ArgumentTypeError("use --split NAME=PATH")
++    return name, Path(path)
++
++
++def _format_row(name: str, block: dict[str, Any]) -> str:
++    def fmt(value: Any) -> str:
++        return "   n/a" if value is None else f"{value:6.3f}"
++
++    return (
++        f"{name:<34}{block['episodes']:>7}  {fmt(block['query_loss'])}  {fmt(block['length_matches_delta'])}"
++        f"  {fmt(block['position_error'])}  {fmt(block['velocity_error'])}"
++        f"  {fmt(block['constant_velocity_velocity_error'])}  {fmt(block['copy_velocity_error'])}"
++    )
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--checkpoint", type=Path, required=True)
++    parser.add_argument("--split", type=_parse_split, action="append", required=True, metavar="NAME=PATH")
++    parser.add_argument("--output-dir", type=Path, required=True)
++    parser.add_argument("--batch-size", type=int, default=256)
++    parser.add_argument("--num-transitions", type=int, help="program steps (default: see above)")
++    parser.add_argument("--visualize", type=int, default=8, help="example episodes to draw per split")
++    parser.add_argument("--cpu", action="store_true")
++    arguments = parser.parse_args(argv)
++
++    device = torch.device("cuda" if torch.cuda.is_available() and not arguments.cpu else "cpu")
++    model = load_neo_checkpoint(arguments.checkpoint, device)
++    arguments.output_dir.mkdir(parents=True, exist_ok=True)
++    reports = {}
++    for name, path in arguments.split:
++        reports[name] = evaluate_split(
++            model,
++            path,
++            batch_size=arguments.batch_size,
++            num_transitions=arguments.num_transitions,
++            device=device,
++            visualize=arguments.visualize,
++            output_dir=arguments.output_dir,
++            name=name,
++        )
++    (arguments.output_dir / "evaluation.json").write_text(json.dumps(reports, indent=2))
++
++    header = (
++        f"{'split / subset':<34}{'eps':>7}  {'qloss':>6}  {'len=Δ':>6}  {'pos_err':>6}  {'vel_err':>6}"
++        f"  {'cv_vel':>6}  {'cp_vel':>6}"
++    )
++    print(header)
++    print("-" * len(header))
++    for name, report in reports.items():
++        print(_format_row(f"{name}", report["all"]))
++        print(_format_row(f"{name} / collision in window", report["query_window_with_collision"]))
++        print(_format_row(f"{name} / no collision", report["query_window_without_collision"]))
++    print(
++        "\npos/vel errors are in world units (the world is 10 wide); cv = constant-velocity "
++        "reference, cp = copy reference.\nFull report: "
++        + str(arguments.output_dir / "evaluation.json")
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/experiment_config.py b/src/tasks/phyworld_collision/experiment_config.py
+new file mode 100644
+index 0000000..c426d73
+--- /dev/null
++++ b/src/tasks/phyworld_collision/experiment_config.py
+@@ -0,0 +1,156 @@
++"""NEO settings for the PhyWorld collision task.
++
++Defaults follow ImageEditing (the paper's continuous-image task) with three
++changes for physics:
++
++* ``max_transition_length = 4`` to match the training deltas 1-4, so a
++  program of length ``delta`` can be "one step of physics" repeated;
++* a small codebook (``action_codebook_size = 8``) so the model cannot keep a
++  separate code for every situation and has to reuse primitives;
++* one GPU (``world_size`` is whatever ``torchrun`` gives; batch 128).
++
++Every field can be overridden from the command line with ``--set name=value``.
++The observation fields (``modality``, ``state_dim``, image size, ...) are
++taken from the pretrained observation checkpoint, not set here.
++"""
++
++from __future__ import annotations
++
++from dataclasses import asdict, dataclass, fields, replace
++from typing import Any, Mapping, Sequence
++
++
++@dataclass(frozen=True, slots=True)
++class TrainingConfig:
++    """One resolved NEO training condition (satisfies ``NEOTrainingConfig``)."""
++
++    # schedule
++    epochs: int = 50
++    batch_size: int = 128
++    num_workers: int = 4
++
++    # latent program shape (state_dim / num_state_tokens come from the VAE)
++    max_transition_length: int = 4
++    state_dim: int = 256
++    action_dim: int = 16
++    num_state_tokens: int = 1
++    num_action_tokens: int = 1
++    policy_hidden_dim: int = 256
++    transition_hidden_dim: int = 256
++    policy_film_layers: int = 4
++    transition_film_layers: int = 4
++    dropout: float = 0.0
++
++    # action codebook
++    action_codebook_size: int = 8
++    action_commitment_weight: float = 0.25
++    action_entropy_weight: float = 0.1
++    action_entropy_temperature: float = 1.0
++    action_ema_decay: float = 0.99
++    action_ema_epsilon: float = 1e-5
++    action_tau_start: float = 0.3  # protocol fields; the EMA quantizer does not anneal
++    action_tau_end: float = 0.1
++
++    # optimisation
++    learning_rate: float = 1e-3
++    policy_learning_rate_scale: float = 0.25
++    transition_learning_rate_scale: float = 0.5
++    weight_decay: float = 0.01
++    warmup_ratio: float = 0.05
++    minimum_learning_rate_ratio: float = 0.1
++    gradient_clip_norm: float = 1.0
++
++    # objective
++    reconstruction_weight: float = 1.0
++    grounding_weight: float = 0.1
++    state_prediction_weight: float = 0.5
++    action_vq_weight: float = 0.5
++    auto_reconstruction_weight: float = 0.0
++    adaptive_grounding: bool = True
++    foreground_weight: float = 10.0
++
++    # MDL length control (>1 penalises longer programs)
++    length_control_start: float = 1.01
++    length_control_end: float = 1.01
++
++    # frozen observation model
++    freeze_observation_encoder: bool = True
++    freeze_observation_decoder: bool = True
++
++    # checkpoints
++    checkpoint_interval_epochs: int = 5
++    log_interval_steps: int = 50
++
++    def __post_init__(self) -> None:
++        if self.epochs < 1 or self.batch_size < 1:
++            raise ValueError("epochs and batch_size must be positive")
++        if self.max_transition_length < 1:
++            raise ValueError("max_transition_length must be positive")
++        if self.action_codebook_size < 2:
++            raise ValueError("action_codebook_size must be at least 2")
++
++    @property
++    def action_tau_steps(self) -> int:
++        return 0
++
++    @property
++    def length_control_coefficient(self) -> float:
++        return self.length_control_start
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, values: Mapping[str, Any]) -> "TrainingConfig":
++        known = {f.name for f in fields(cls)}
++        return cls(**{k: v for k, v in values.items() if k in known})
++
++
++@dataclass(frozen=True, slots=True)
++class Experiment:
++    """Satisfies ``models.config.NEOExperimentConfig``."""
++
++    training: TrainingConfig
++
++    @property
++    def length_control_coefficient(self) -> float:
++        return self.training.length_control_start
++
++    def scheduled_length_control(self, progress: float) -> float:
++        """Linear schedule from ``length_control_start`` to ``length_control_end``."""
++
++        progress = min(max(progress, 0.0), 1.0)
++        start, end = self.training.length_control_start, self.training.length_control_end
++        return start + (end - start) * progress
++
++
++def _coerce(field_type: Any, text: str) -> Any:
++    kind = field_type if isinstance(field_type, str) else getattr(field_type, "__name__", str(field_type))
++    if kind == "bool":
++        if text.lower() in ("1", "true", "yes", "on"):
++            return True
++        if text.lower() in ("0", "false", "no", "off"):
++            return False
++        raise ValueError(f"not a boolean: {text!r}")
++    if kind == "int":
++        return int(text)
++    if kind == "float":
++        return float(text)
++    return text
++
++
++def apply_overrides(config: TrainingConfig, assignments: Sequence[str]) -> TrainingConfig:
++    """Apply ``name=value`` strings, e.g. ``["epochs=10", "action_codebook_size=4"]``."""
++
++    types = {f.name: f.type for f in fields(TrainingConfig)}
++    updates: dict[str, Any] = {}
++    for assignment in assignments:
++        name, separator, value = assignment.partition("=")
++        name = name.strip()
++        if not separator or name not in types:
++            raise ValueError(f"unknown setting {assignment!r}; valid names: {', '.join(sorted(types))}")
++        updates[name] = _coerce(types[name], value.strip())
++    return replace(config, **updates)
++
++
++__all__ = ["Experiment", "TrainingConfig", "apply_overrides"]
+diff --git a/src/tasks/phyworld_collision/models/__init__.py b/src/tasks/phyworld_collision/models/__init__.py
+new file mode 100644
+index 0000000..323772c
+--- /dev/null
++++ b/src/tasks/phyworld_collision/models/__init__.py
+@@ -0,0 +1 @@
++"""Observation models for the PhyWorld collision task."""
+diff --git a/src/tasks/phyworld_collision/models/vae.py b/src/tasks/phyworld_collision/models/vae.py
+new file mode 100644
+index 0000000..90aa02c
+--- /dev/null
++++ b/src/tasks/phyworld_collision/models/vae.py
+@@ -0,0 +1,221 @@
++"""Observation models: a conv VAE for stacked frames and an MLP VAE for state vectors.
++
++Both encoders return ``(posterior.mean, posterior)`` with ``mean`` shaped
++``(B, num_state_tokens, state_dim)``, which is the contract of the shared
++:class:`models.neo.NEO`.  The conv VAE reuses the residual blocks of the
++ImageEditing VAE and generalises its sizes: ``image_size`` 64 with an 8x8
++bottleneck gives three stride-2 stages, as 32 -> 4 does for ImageEditing.
++"""
++
++from __future__ import annotations
++
++import math
++from dataclasses import asdict, dataclass, fields
++from typing import Any, Mapping
++
++import torch
++from torch import Tensor, nn
++
++from tasks.image_editing.models.vae import GaussianPosterior, ResidualBlock, ResidualUpBlock
++from tasks.phyworld_collision.physics import STATE_DIM
++
++
++@dataclass(frozen=True, slots=True)
++class ObservationConfig:
++    """Architecture of the observation model; saved inside every checkpoint."""
++
++    modality: str = "pixels"  # "pixels" or "states"
++    state_dim: int = 256
++    num_state_tokens: int = 1
++    dropout: float = 0.0
++    # pixels
++    image_size: int = 64
++    channels: int = 6
++    base_channels: int = 64
++    bottleneck_channels: int = 256
++    bottleneck_size: int = 8
++    # states
++    input_dim: int = STATE_DIM
++    hidden_dim: int = 256
++
++    def __post_init__(self) -> None:
++        if self.modality not in ("pixels", "states"):
++            raise ValueError(f"modality must be 'pixels' or 'states', got {self.modality!r}")
++        if self.state_dim < 1 or self.num_state_tokens < 1:
++            raise ValueError("state_dim and num_state_tokens must be positive")
++        if self.modality == "pixels":
++            ratio = self.image_size / self.bottleneck_size
++            if ratio < 1 or not float(ratio).is_integer() or not math.log2(ratio).is_integer():
++                raise ValueError("image_size / bottleneck_size must be a power of two")
++
++    @property
++    def latent_dim(self) -> int:
++        return self.state_dim * self.num_state_tokens
++
++    @property
++    def num_downsamples(self) -> int:
++        return int(math.log2(self.image_size // self.bottleneck_size))
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, values: Mapping[str, Any]) -> "ObservationConfig":
++        known = {f.name for f in fields(cls)}
++        return cls(**{k: v for k, v in values.items() if k in known})
++
++
++def _stage_channels(config: ObservationConfig) -> list[int]:
++    channels = [config.base_channels * 2 ** (i + 1) for i in range(config.num_downsamples)]
++    if channels:
++        channels[-1] = config.bottleneck_channels
++    return channels
++
++
++def to_float_channels_first(image: Tensor, channels: int, image_size: int) -> Tensor:
++    """``(B, H, W, C)`` uint8 or ``[0, 1]`` floats -> ``(B, C, H, W)`` float32."""
++
++    if image.ndim != 4:
++        raise ValueError(f"image must be 4-dimensional, got {tuple(image.shape)}")
++    if image.shape[-1] == channels and image.shape[1] == image_size:
++        image = image.permute(0, 3, 1, 2)
++    if tuple(image.shape[1:]) != (channels, image_size, image_size):
++        raise ValueError(
++            f"expected (B, {image_size}, {image_size}, {channels}) images, got {tuple(image.shape)}"
++        )
++    if image.dtype == torch.uint8:
++        return image.float() / 255.0
++    return image.float()
++
++
++class ConvEncoder(nn.Module):
++    def __init__(self, config: ObservationConfig) -> None:
++        super().__init__()
++        self.config = config
++        self.stem = nn.Sequential(
++            nn.Conv2d(config.channels, config.base_channels, 3, padding=1, bias=False),
++            nn.BatchNorm2d(config.base_channels),
++            nn.ReLU(inplace=True),
++            ResidualBlock(config.base_channels, config.base_channels, 1, config.dropout),
++        )
++        stages = []
++        previous = config.base_channels
++        for out_channels in _stage_channels(config):
++            stages.append(ResidualBlock(previous, out_channels, 2, config.dropout))
++            previous = out_channels
++        self.stages = nn.Sequential(*stages)
++        flattened = config.bottleneck_channels * config.bottleneck_size**2
++        self.to_mean = nn.Linear(flattened, config.latent_dim)
++        self.to_logvar = nn.Linear(flattened, config.latent_dim)
++
++    def forward(self, image: Tensor) -> tuple[Tensor, GaussianPosterior]:
++        config = self.config
++        x = to_float_channels_first(image, config.channels, config.image_size)
++        features = self.stages(self.stem(x)).flatten(1)
++        shape = (x.shape[0], config.num_state_tokens, config.state_dim)
++        posterior = GaussianPosterior(
++            mean=self.to_mean(features).view(shape),
++            log_variance=self.to_logvar(features).view(shape).clamp(-20.0, 10.0),
++        )
++        return posterior.mean, posterior
++
++
++class ConvDecoder(nn.Module):
++    def __init__(self, config: ObservationConfig) -> None:
++        super().__init__()
++        self.config = config
++        flattened = config.bottleneck_channels * config.bottleneck_size**2
++        self.from_state = nn.Linear(config.latent_dim, flattened)
++        encoder_channels = [config.base_channels, *_stage_channels(config)]
++        blocks = []
++        previous = config.bottleneck_channels
++        for out_channels in reversed(encoder_channels[:-1]):
++            blocks.append(ResidualUpBlock(previous, out_channels, config.dropout))
++            previous = out_channels
++        self.blocks = nn.Sequential(*blocks)
++        self.head = nn.Sequential(nn.Conv2d(previous, config.channels, 3, padding=1), nn.Sigmoid())
++
++    def forward(self, state: Tensor) -> Tensor:
++        config = self.config
++        expected = (config.num_state_tokens, config.state_dim)
++        if state.ndim != 3 or tuple(state.shape[1:]) != expected:
++            raise ValueError(f"state must be (B, {expected[0]}, {expected[1]}), got {tuple(state.shape)}")
++        x = self.from_state(state.reshape(state.shape[0], -1)).view(
++            state.shape[0], config.bottleneck_channels, config.bottleneck_size, config.bottleneck_size
++        )
++        return self.head(self.blocks(x)).permute(0, 2, 3, 1)
++
++
++class StateEncoder(nn.Module):
++    def __init__(self, config: ObservationConfig) -> None:
++        super().__init__()
++        self.config = config
++        self.body = nn.Sequential(
++            nn.Linear(config.input_dim, config.hidden_dim),
++            nn.ReLU(),
++            nn.Linear(config.hidden_dim, config.hidden_dim),
++            nn.ReLU(),
++        )
++        self.to_mean = nn.Linear(config.hidden_dim, config.latent_dim)
++        self.to_logvar = nn.Linear(config.hidden_dim, config.latent_dim)
++
++    def forward(self, state_vector: Tensor) -> tuple[Tensor, GaussianPosterior]:
++        config = self.config
++        if state_vector.ndim != 2 or state_vector.shape[1] != config.input_dim:
++            raise ValueError(f"expected (B, {config.input_dim}) states, got {tuple(state_vector.shape)}")
++        hidden = self.body(state_vector.float())
++        shape = (state_vector.shape[0], config.num_state_tokens, config.state_dim)
++        posterior = GaussianPosterior(
++            mean=self.to_mean(hidden).view(shape),
++            log_variance=self.to_logvar(hidden).view(shape).clamp(-20.0, 10.0),
++        )
++        return posterior.mean, posterior
++
++
++class StateDecoder(nn.Module):
++    def __init__(self, config: ObservationConfig) -> None:
++        super().__init__()
++        self.config = config
++        self.body = nn.Sequential(
++            nn.Linear(config.latent_dim, config.hidden_dim),
++            nn.ReLU(),
++            nn.Linear(config.hidden_dim, config.hidden_dim),
++            nn.ReLU(),
++            nn.Linear(config.hidden_dim, config.input_dim),
++        )
++
++    def forward(self, state: Tensor) -> Tensor:
++        return self.body(state.reshape(state.shape[0], -1))
++
++
++class ObservationVAE(nn.Module):
++    """Encoder/decoder pair with ``encoder.*`` / ``decoder.*`` parameter names."""
++
++    def __init__(self, config: ObservationConfig) -> None:
++        super().__init__()
++        self.config = config
++        if config.modality == "pixels":
++            self.encoder: nn.Module = ConvEncoder(config)
++            self.decoder: nn.Module = ConvDecoder(config)
++        else:
++            self.encoder = StateEncoder(config)
++            self.decoder = StateDecoder(config)
++
++    def forward(self, observation: Tensor, *, sample: bool = True) -> tuple[Tensor, GaussianPosterior]:
++        mean, posterior = self.encoder(observation)
++        state = mean
++        if sample and self.training:
++            noise = torch.randn_like(mean)
++            state = mean + noise * torch.exp(0.5 * posterior.log_variance)
++        return self.decoder(state), posterior
++
++
++__all__ = [
++    "ConvDecoder",
++    "ConvEncoder",
++    "ObservationConfig",
++    "ObservationVAE",
++    "StateDecoder",
++    "StateEncoder",
++    "to_float_channels_first",
++]
+diff --git a/src/tasks/phyworld_collision/objective.py b/src/tasks/phyworld_collision/objective.py
+new file mode 100644
+index 0000000..fb194d0
+--- /dev/null
++++ b/src/tasks/phyworld_collision/objective.py
+@@ -0,0 +1,151 @@
++"""Observation semantics supplied to the shared NEO model.
++
++Pixels
++    Observations are ``(64, 64, 6)`` uint8 (two stacked RGB frames).  The
++    loss is a **foreground-weighted L1**: pixels that belong to a ball in the
++    target get ``foreground_weight`` times the weight of white background.
++    Without it, a model can reach a low plain L1 by drawing an empty white
++    image, because the balls cover only a few percent of the pixels.
++    Grounding snaps decoded images to 8 bits, as in ImageEditing; there is no
++    exact match for continuous images.
++
++States
++    Observations are the 10-number vectors of :func:`physics.state_vector`;
++    the loss is MSE and grounding is the identity.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import torch
++from torch import Tensor
++
++
++QUANTISATION_LEVELS = 255
++FOREGROUND_THRESHOLD = 0.9  # a pixel is ball if any channel is darker than this
++
++
++@dataclass(frozen=True, slots=True)
++class CollisionMetrics:
++    """Mean absolute error overall and on ball pixels (pixels), or MSE (states)."""
++
++    l1: float
++    foreground_l1: float
++
++
++def _split_pairs(batch: Tensor) -> tuple[Tensor, Tensor]:
++    trailing = batch.shape[2:]
++    return batch[:, ::2].reshape(-1, *trailing), batch[:, 1::2].reshape(-1, *trailing)
++
++
++def _validate_pairs(batch: Tensor, *, is_eval: bool, trailing: tuple[int, ...]) -> None:
++    if batch.ndim != 2 + len(trailing):
++        raise ValueError(f"episodes must be (B, pairs*2, {trailing}), got {tuple(batch.shape)}")
++    if batch.shape[1] < 2 or batch.shape[1] % 2:
++        raise ValueError("episodes must contain an even, non-zero number of observations")
++    if tuple(batch.shape[2:]) != trailing:
++        raise ValueError(f"observations must be {trailing}, got {tuple(batch.shape[2:])}")
++    if is_eval and batch.shape[1] != 4:
++        raise ValueError("evaluation needs one support and one query pair per episode")
++
++
++def foreground_mask(target: Tensor) -> Tensor:
++    """``(..., H, W, C)`` in [0, 1] -> ``(..., H, W, 1)`` mask of non-white pixels per frame.
++
++    The six channels are two RGB frames; each frame gets its own mask.
++    """
++
++    frames = target.unflatten(-1, (-1, 3))  # (..., H, W, F, 3)
++    mask = (frames.min(dim=-1).values < FOREGROUND_THRESHOLD).float()  # (..., H, W, F)
++    return mask.repeat_interleave(3, dim=-1)
++
++
++class PixelObjective:
++    """Pairing, weighted L1, 8-bit grounding and metrics for stacked frames."""
++
++    def __init__(self, image_size: int, channels: int, foreground_weight: float) -> None:
++        self.shape = (image_size, image_size, channels)
++        self.foreground_weight = float(foreground_weight)
++
++    def validate_batch(self, batch: Tensor, *, is_eval: bool) -> None:
++        _validate_pairs(batch, is_eval=is_eval, trailing=self.shape)
++
++    def split_batch(self, batch: Tensor) -> tuple[Tensor, Tensor]:
++        return _split_pairs(batch)
++
++    @staticmethod
++    def normalize(target: Tensor) -> Tensor:
++        return target.float() / 255.0 if target.dtype == torch.uint8 else target.float()
++
++    def weights(self, target: Tensor) -> Tensor:
++        return 1.0 + (self.foreground_weight - 1.0) * foreground_mask(target)
++
++    def per_sample_reconstruction_loss(self, prediction: Tensor, target: Tensor) -> Tensor:
++        target = self.normalize(target)
++        weights = self.weights(target)
++        error = (prediction.float() - target).abs() * weights
++        return error.flatten(1).sum(dim=1) / weights.flatten(1).sum(dim=1)
++
++    def reconstruction_loss(self, prediction: Tensor, target: Tensor) -> Tensor:
++        return self.per_sample_reconstruction_loss(prediction, target).mean()
++
++    def decode_prediction(self, prediction: Tensor) -> Tensor:
++        return torch.round(prediction.clamp(0.0, 1.0) * QUANTISATION_LEVELS) / QUANTISATION_LEVELS
++
++    def exact_match(self, prediction: Tensor, target: Tensor) -> Tensor:
++        return torch.zeros(target.shape[0], dtype=torch.bool, device=prediction.device)
++
++    @torch.no_grad()
++    def metrics(self, prediction: Tensor, target: Tensor) -> CollisionMetrics:
++        target = self.normalize(target)
++        error = (prediction.float() - target).abs()
++        mask = torch.maximum(foreground_mask(target), foreground_mask(prediction.float()))
++        foreground = (error * mask).sum() / mask.sum().clamp_min(1.0)
++        return CollisionMetrics(l1=error.mean().item(), foreground_l1=foreground.item())
++
++    def empty_metrics(self) -> CollisionMetrics:
++        return CollisionMetrics(l1=0.0, foreground_l1=0.0)
++
++
++class StateObjective:
++    """Pairing, MSE and metrics for state vectors."""
++
++    def __init__(self, input_dim: int) -> None:
++        self.shape = (input_dim,)
++
++    def validate_batch(self, batch: Tensor, *, is_eval: bool) -> None:
++        _validate_pairs(batch, is_eval=is_eval, trailing=self.shape)
++
++    def split_batch(self, batch: Tensor) -> tuple[Tensor, Tensor]:
++        inputs, targets = _split_pairs(batch)
++        return inputs.float(), targets.float()
++
++    def per_sample_reconstruction_loss(self, prediction: Tensor, target: Tensor) -> Tensor:
++        return (prediction.float() - target.float()).pow(2).mean(dim=1)
++
++    def reconstruction_loss(self, prediction: Tensor, target: Tensor) -> Tensor:
++        return self.per_sample_reconstruction_loss(prediction, target).mean()
++
++    def decode_prediction(self, prediction: Tensor) -> Tensor:
++        return prediction.float()
++
++    def exact_match(self, prediction: Tensor, target: Tensor) -> Tensor:
++        return torch.zeros(target.shape[0], dtype=torch.bool, device=prediction.device)
++
++    @torch.no_grad()
++    def metrics(self, prediction: Tensor, target: Tensor) -> CollisionMetrics:
++        error = (prediction.float() - target.float()).abs()
++        return CollisionMetrics(l1=error.mean().item(), foreground_l1=error.mean().item())
++
++    def empty_metrics(self) -> CollisionMetrics:
++        return CollisionMetrics(l1=0.0, foreground_l1=0.0)
++
++
++__all__ = [
++    "CollisionMetrics",
++    "FOREGROUND_THRESHOLD",
++    "PixelObjective",
++    "StateObjective",
++    "foreground_mask",
++]
+diff --git a/src/tasks/phyworld_collision/observation_pretraining.py b/src/tasks/phyworld_collision/observation_pretraining.py
+new file mode 100644
+index 0000000..027ef1e
+--- /dev/null
++++ b/src/tasks/phyworld_collision/observation_pretraining.py
+@@ -0,0 +1,247 @@
++"""Pretrain the observation VAE on single observations of the episode files.
++
++NEO keeps this model frozen, so its reconstructions bound everything NEO can
++predict.  Check ``reconstructions_epoch*.png`` in the run directory: both
++balls must be sharp and in the right place before you train NEO.
++
++Pixels (default)::
++
++    python -m tasks.phyworld_collision.observation_pretraining \\
++        --train-h5 data/collision/train.h5 --test-h5 data/collision/id_test.h5 \\
++        --output-root runs/collision/observation --epochs 30
++
++States::
++
++    python -m tasks.phyworld_collision.observation_pretraining --modality states \\
++        --state-dim 64 --train-h5 ... --test-h5 ... --output-root ... --epochs 50
++
++The run directory gets ``checkpoints/best.pt`` (lowest test loss) and
++``checkpoints/final.pt``; pass either to the NEO runner.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import time
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++import torch
++from torch.utils.data import DataLoader, Subset
++
++from tasks.phyworld_collision.data.dataset import ObservationDataset
++from tasks.phyworld_collision.models.vae import ObservationConfig, ObservationVAE
++from tasks.phyworld_collision.objective import PixelObjective, StateObjective
++from tasks.phyworld_collision.visualize import save_rows
++from training.runtime import bfloat16_autocast, initialize_distributed, seed_everything
++
++
++def _loss_function(config: ObservationConfig, foreground_weight: float):
++    if config.modality == "pixels":
++        objective = PixelObjective(config.image_size, config.channels, foreground_weight)
++    else:
++        objective = StateObjective(config.input_dim)
++    return objective
++
++
++def _evaluate(model, loader, objective, device) -> dict[str, float]:
++    model.eval()
++    total = {"loss": 0.0, "l1": 0.0, "foreground_l1": 0.0}
++    count = 0
++    with torch.no_grad():
++        for batch in loader:
++            batch = batch.to(device)
++            with bfloat16_autocast(device):
++                reconstruction, _ = model(batch, sample=False)
++            loss = objective.reconstruction_loss(reconstruction.float(), batch)
++            metrics = objective.metrics(reconstruction.float(), batch)
++            n = batch.shape[0]
++            total["loss"] += float(loss) * n
++            total["l1"] += metrics.l1 * n
++            total["foreground_l1"] += metrics.foreground_l1 * n
++            count += n
++    return {key: value / max(count, 1) for key, value in total.items()}
++
++
++def _save_reconstructions(model, dataset, device, path: Path, count: int = 8) -> None:
++    model.eval()
++    indices = np.linspace(0, len(dataset) - 1, count).astype(int)
++    batch = torch.stack([dataset[int(i)] for i in indices]).to(device)
++    with torch.no_grad():
++        reconstruction, _ = model(batch, sample=False)
++    rows = [[batch[i].cpu().numpy(), reconstruction[i].float().cpu().numpy()] for i in range(count)]
++    save_rows(path, rows)
++
++
++def run(arguments: argparse.Namespace) -> Path:
++    seed_everything(arguments.seed)
++    context = initialize_distributed(force_cpu=arguments.cpu)
++    if context.is_distributed:
++        raise SystemExit("observation pretraining runs on one device; launch without torchrun")
++    device = context.device
++
++    train_set = ObservationDataset(arguments.train_h5, arguments.modality)
++    test_set = ObservationDataset(arguments.test_h5, arguments.modality)
++    attributes = train_set.attributes
++    config = ObservationConfig(
++        modality=arguments.modality,
++        state_dim=arguments.state_dim,
++        dropout=arguments.dropout,
++        image_size=int(attributes["image_size"]),
++        base_channels=arguments.base_channels,
++        bottleneck_channels=arguments.bottleneck_channels,
++        bottleneck_size=arguments.bottleneck_size,
++        hidden_dim=arguments.hidden_dim,
++    )
++    objective = _loss_function(config, arguments.foreground_weight)
++    model = ObservationVAE(config).to(device)
++
++    if arguments.max_test_observations and len(test_set) > arguments.max_test_observations:
++        picked = np.linspace(0, len(test_set) - 1, arguments.max_test_observations).astype(int)
++        test_subset = Subset(test_set, picked.tolist())
++    else:
++        test_subset = test_set
++    generator = torch.Generator().manual_seed(arguments.seed)
++    train_loader = DataLoader(
++        train_set,
++        batch_size=arguments.batch_size,
++        shuffle=True,
++        num_workers=arguments.num_workers,
++        pin_memory=device.type == "cuda",
++        drop_last=len(train_set) > arguments.batch_size,
++        generator=generator,
++        persistent_workers=arguments.num_workers > 0,
++    )
++    test_loader = DataLoader(
++        test_subset, batch_size=arguments.batch_size, shuffle=False, num_workers=arguments.num_workers
++    )
++
++    total_steps = arguments.epochs * max(len(train_loader), 1)
++    warmup = int(0.02 * total_steps)
++    optimizer = torch.optim.AdamW(model.parameters(), lr=arguments.learning_rate, weight_decay=0.0)
++
++    def multiplier(step: int) -> float:
++        if step < warmup:
++            return (step + 1) / warmup
++        progress = (step - warmup) / max(total_steps - warmup, 1)
++        return 0.05 + 0.95 * 0.5 * (1.0 + math.cos(math.pi * progress))
++
++    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
++
++    stamp = time.strftime("%Y%m%dT%H%M%S")
++    run_directory = Path(arguments.output_root).expanduser().resolve() / f"{config.modality}-{stamp}"
++    (run_directory / "checkpoints").mkdir(parents=True, exist_ok=False)
++    resolved = {
++        "observation_config": config.to_dict(),
++        "train_h5": str(train_set.path),
++        "test_h5": str(test_set.path),
++        **{k: (str(v) if isinstance(v, Path) else v) for k, v in vars(arguments).items()},
++    }
++    (run_directory / "config.json").write_text(json.dumps(resolved, indent=2))
++    log = (run_directory / "metrics.jsonl").open("x")
++
++    def save(name: str, epoch: int, metrics: dict) -> Path:
++        path = run_directory / "checkpoints" / name
++        torch.save(
++            {
++                "model_state_dict": model.state_dict(),
++                "observation_config": config.to_dict(),
++                "epoch": epoch,
++                "metrics": metrics,
++            },
++            path,
++        )
++        return path
++
++    best = math.inf
++    step = 0
++    started = time.monotonic()
++    try:
++        for epoch in range(arguments.epochs):
++            model.train()
++            for batch in train_loader:
++                batch = batch.to(device, non_blocking=True)
++                with bfloat16_autocast(device):
++                    reconstruction, posterior = model(batch)
++                reconstruction_loss = objective.reconstruction_loss(reconstruction.float(), batch)
++                kl = posterior.kl_to_standard_normal().float()
++                loss = reconstruction_loss + arguments.kl_weight * kl
++                optimizer.zero_grad(set_to_none=True)
++                loss.backward()
++                gradient_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
++                optimizer.step()
++                scheduler.step()
++                step += 1
++                if step % arguments.log_interval == 0:
++                    record = {
++                        "step": step,
++                        "epoch": epoch,
++                        "train/loss": float(loss),
++                        "train/reconstruction": float(reconstruction_loss),
++                        "train/kl": float(kl),
++                        "train/gradient_norm": float(gradient_norm),
++                        "train/lr": scheduler.get_last_lr()[0],
++                    }
++                    log.write(json.dumps(record) + "\n")
++                    log.flush()
++            metrics = _evaluate(model, test_loader, objective, device)
++            record = {"step": step, "epoch": epoch, **{f"test/{k}": v for k, v in metrics.items()}}
++            log.write(json.dumps(record) + "\n")
++            log.flush()
++            print(json.dumps(record), flush=True)
++            if config.modality == "pixels":
++                _save_reconstructions(
++                    model, test_set, device, run_directory / f"reconstructions_epoch{epoch:03d}.png"
++                )
++            if metrics["loss"] < best:
++                best = metrics["loss"]
++                save("best.pt", epoch, metrics)
++        save("final.pt", arguments.epochs - 1, metrics)
++    finally:
++        log.close()
++    (run_directory / "result.json").write_text(
++        json.dumps(
++            {"best_test_loss": best, "seconds": time.monotonic() - started, "final": metrics},
++            indent=2,
++        )
++    )
++    return run_directory
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--train-h5", type=Path, required=True)
++    parser.add_argument("--test-h5", type=Path, required=True)
++    parser.add_argument("--output-root", type=Path, required=True)
++    parser.add_argument("--modality", choices=("pixels", "states"), default="pixels")
++    parser.add_argument("--state-dim", type=int, default=256)
++    parser.add_argument("--base-channels", type=int, default=64)
++    parser.add_argument("--bottleneck-channels", type=int, default=256)
++    parser.add_argument("--bottleneck-size", type=int, default=8)
++    parser.add_argument("--hidden-dim", type=int, default=256, help="MLP width (states)")
++    parser.add_argument("--dropout", type=float, default=0.0)
++    parser.add_argument("--epochs", type=int, default=30)
++    parser.add_argument("--batch-size", type=int, default=256)
++    parser.add_argument("--learning-rate", type=float, default=1e-3)
++    parser.add_argument("--kl-weight", type=float, default=1e-5)
++    parser.add_argument("--foreground-weight", type=float, default=10.0)
++    parser.add_argument("--max-test-observations", type=int, default=8000)
++    parser.add_argument("--num-workers", type=int, default=4)
++    parser.add_argument("--log-interval", type=int, default=50)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--cpu", action="store_true", help="force CPU (smoke tests)")
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    arguments = build_parser().parse_args(argv)
++    run_directory = run(arguments)
++    print(json.dumps({"run_directory": str(run_directory)}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/physics.py b/src/tasks/phyworld_collision/physics.py
+new file mode 100644
+index 0000000..aae88fd
+--- /dev/null
++++ b/src/tasks/phyworld_collision/physics.py
+@@ -0,0 +1,371 @@
++"""PhyWorld two-ball collision: constants, rendering, simulation and ball tracking.
++
++Everything here is NumPy-only so it can be used by the data tools, the
++evaluation and the tests without PyTorch.
++
++Conventions copied from PhyWorld ``id_ood_data/two_balls_collision.py``:
++
++* the world is ``WORLD_SCALE = 10`` units wide and high;
++* Box2D runs at ``timestep = 0.01`` and every ``STRIDE = 10``-th step is kept,
++  so consecutive frames are ``FRAME_DT = 0.1`` seconds apart;
++* each video has ``NUM_FRAMES = 32`` frames;
++* ball 1 is red, starts on the left and moves right with speed ``v1``;
++  ball 2 is blue, starts on the right and moves left with speed ``v2``;
++* both balls have density 1, so their masses are proportional to ``r**2``;
++* positions are stored as ``(frames, ball, xy)`` in world units and the
++  rendered image is flipped vertically (``frames[:, ::-1]``).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++import numpy as np
++
++
++WORLD_SCALE = 10.0
++TIMESTEP = 0.01
++STRIDE = 10
++FRAME_DT = TIMESTEP * STRIDE
++NUM_FRAMES = 32
++MIN_PRE_FRAMES = 8
++MIN_POST_FRAMES = 8
++
++#: In-distribution ranges of the PhyWorld collision training data.
++ID_VELOCITY_RANGE = (1.0, 4.0)
++ID_RADIUS_RANGE = (0.5, 1.5)
++
++#: Box2D treats contacts slower than this relative speed as inelastic.
++BOX2D_VELOCITY_THRESHOLD = 1.0
++
++BALL_COLORS = np.array([(255, 0, 0), (0, 0, 255)], dtype=np.float64)
++
++#: Normalisation of the state vector (see :func:`state_vector`).
++POSITION_SCALE = WORLD_SCALE
++VELOCITY_SCALE = 4.0
++RADIUS_SCALE = 1.5
++STATE_DIM = 10
++
++
++# ---------------------------------------------------------------------------
++# Rendering
++# ---------------------------------------------------------------------------
++
++
++def render_frames(
++    positions: np.ndarray,
++    radii: np.ndarray,
++    image_size: int,
++    *,
++    edge_width: float = 0.03,
++) -> np.ndarray:
++    """Render ``(T, 2, 2)`` world positions as ``(T, S, S, 3)`` uint8 frames.
++
++    This is PhyWorld's ``vectorized_draw_balls`` (soft-edged discs on white,
++    ball 2 drawn over ball 1) followed by its vertical flip.
++    """
++
++    positions = np.asarray(positions, dtype=np.float64)
++    if positions.ndim == 2:
++        positions = positions[None]
++    if positions.shape[1:] != (2, 2):
++        raise ValueError(f"positions must be (T, 2, 2), got {positions.shape}")
++    normalized_positions = positions / WORLD_SCALE
++    normalized_radii = np.asarray(radii, dtype=np.float64) / WORLD_SCALE
++
++    grid = np.linspace(0.0, 1.0, image_size)
++    xs, ys = np.meshgrid(grid, grid)
++    frames = np.full((positions.shape[0], image_size, image_size, 3), 255.0)
++    for ball in range(2):
++        dx = xs[None] - normalized_positions[:, ball, 0, None, None]
++        dy = ys[None] - normalized_positions[:, ball, 1, None, None]
++        radius_squared = normalized_radii[ball] ** 2
++        mask = np.clip(
++            (radius_squared - (dx**2 + dy**2)) / (radius_squared * edge_width), 0.0, 1.0
++        )[..., None]
++        frames = (1.0 - mask) * frames + mask * BALL_COLORS[ball]
++    frames = frames.astype(np.uint8)
++    return np.ascontiguousarray(frames[:, ::-1])
++
++
++def downsample_frames(frames: np.ndarray, image_size: int) -> np.ndarray:
++    """Area-downsample ``(T, H, W, 3)`` uint8 frames to ``image_size``."""
++
++    frames = np.asarray(frames)
++    height, width = frames.shape[1:3]
++    if height == image_size and width == image_size:
++        return frames.astype(np.uint8, copy=False)
++    if height % image_size == 0 and width % image_size == 0:
++        fy, fx = height // image_size, width // image_size
++        blocks = frames.reshape(
++            frames.shape[0], image_size, fy, image_size, fx, frames.shape[3]
++        )
++        return np.round(blocks.mean(axis=(2, 4))).astype(np.uint8)
++    from PIL import Image
++
++    return np.stack(
++        [
++            np.asarray(
++                Image.fromarray(frame).resize((image_size, image_size), Image.BOX)
++            )
++            for frame in frames
++        ]
++    )
++
++
++# ---------------------------------------------------------------------------
++# Analytic simulation (PhyWorld-compatible, no Box2D needed)
++# ---------------------------------------------------------------------------
++
++
++def masses(r1: float, r2: float) -> tuple[float, float]:
++    """Disc masses at density 1."""
++
++    return np.pi * r1**2, np.pi * r2**2
++
++
++def post_collision_velocities(
++    r1: float, r2: float, u1: float, u2: float, *, inelastic_threshold: float | None
++) -> tuple[float, float]:
++    """Velocities after a head-on contact; ``u1``/``u2`` are signed x-velocities."""
++
++    m1, m2 = masses(r1, r2)
++    if inelastic_threshold is not None and (u1 - u2) < inelastic_threshold:
++        common = (m1 * u1 + m2 * u2) / (m1 + m2)
++        return common, common
++    w1 = ((m1 - m2) * u1 + 2.0 * m2 * u2) / (m1 + m2)
++    w2 = ((m2 - m1) * u2 + 2.0 * m1 * u1) / (m1 + m2)
++    return w1, w2
++
++
++def sample_initial_positions(
++    r1: float,
++    r2: float,
++    v1: float,
++    v2: float,
++    rng: np.random.Generator,
++    *,
++    eps: float = 0.05,
++) -> tuple[float, float, float] | None:
++    """Port of PhyWorld's placement logic; returns ``(x1, x2, height)``.
++
++    The original's control flow is kept on purpose, including its quirks: the
++    ``r1 > 2 r2`` branch is followed by an independent ``if/else`` (so its
++    else-branch overrides it), ``max_pre_dist`` is reused across retries, and a
++    scene that needed 10 or more retries is discarded (returns ``None``).
++    """
++
++    def uniform(low: float, high: float) -> float:
++        return float(rng.random() * (high - low) + low)
++
++    frame_time = TIMESTEP * STRIDE
++    min_pre_dist = MIN_PRE_FRAMES * (v1 + v2) * frame_time + r1 + r2
++    max_pre_dist = (NUM_FRAMES - MIN_POST_FRAMES) * frame_time * (v1 + v2) + r1 + r2
++    x1 = x2 = 0.0
++    tries = 0
++    while tries < 50:
++        if r1 > 2 * r2:
++            max_pre_dist = min(min_pre_dist * 1.25, WORLD_SCALE - r1 - r2)
++            dist = uniform(min_pre_dist, max_pre_dist)
++            x1_left = r1
++            x1_right = x1_left + eps * WORLD_SCALE
++        if r2 > 2 * r1:
++            max_pre_dist = min(min_pre_dist * 1.25, WORLD_SCALE - r1 - r2)
++            dist = uniform(min_pre_dist, max_pre_dist)
++            x1_right = WORLD_SCALE - r2 - dist
++            x1_left = x1_right - eps * WORLD_SCALE
++        else:
++            max_pre_dist = min(max_pre_dist, WORLD_SCALE - r1 - r2)
++            dist = uniform(min_pre_dist, max_pre_dist)
++            x1_left = r1
++            x1_right = WORLD_SCALE - r2 - dist
++        x1 = max(uniform(x1_left, x1_right), r1)
++        x2 = min(x1 + dist, WORLD_SCALE - r2)
++        pre_frames = (
++            (x2 - x1 - r1 - r2) / (v1 + v2) / frame_time
++            if v1 + v2 > 0
++            else MIN_PRE_FRAMES + 1
++        )
++        if pre_frames < MIN_PRE_FRAMES:
++            tries += 1
++            continue
++        break
++    if tries >= 10:
++        return None
++    max_r = max(r1, r2)
++    height = uniform(max_r + eps * WORLD_SCALE, (1 - eps) * WORLD_SCALE - max_r)
++    return float(x1), float(x2), float(height)
++
++
++def simulate_collision(
++    r1: float,
++    r2: float,
++    v1: float,
++    v2: float,
++    x1: float,
++    x2: float,
++    height: float,
++    *,
++    num_frames: int = NUM_FRAMES,
++    inelastic_threshold: float | None = BOX2D_VELOCITY_THRESHOLD,
++) -> np.ndarray:
++    """Closed-form 1D collision sampled like PhyWorld; returns ``(T, 2, 2)``.
++
++    Box2D records positions after steps ``0, 10, 20, ...``, i.e. at times
++    ``(10 k + 1) * 0.01``.  Between contacts the balls move uniformly; at
++    contact the velocities change by :func:`post_collision_velocities`.
++    """
++
++    times = (STRIDE * np.arange(num_frames) + 1) * TIMESTEP
++    u1, u2 = float(v1), -float(v2)
++    gap = x2 - x1 - r1 - r2
++    closing = u1 - u2
++    contact_time = gap / closing if closing > 0 and gap >= 0 else np.inf
++    w1, w2 = post_collision_velocities(
++        r1, r2, u1, u2, inelastic_threshold=inelastic_threshold
++    )
++
++    before = times < contact_time
++    after_dt = np.where(before, 0.0, times - contact_time)
++    pre_dt = np.where(before, times, contact_time)
++    xs1 = x1 + u1 * pre_dt + w1 * after_dt
++    xs2 = x2 + u2 * pre_dt + w2 * after_dt
++
++    positions = np.empty((num_frames, 2, 2), dtype=np.float64)
++    positions[:, 0, 0] = xs1
++    positions[:, 1, 0] = xs2
++    positions[:, :, 1] = height
++    return positions
++
++
++# ---------------------------------------------------------------------------
++# Events and state vectors
++# ---------------------------------------------------------------------------
++
++
++def collision_frame(positions: np.ndarray, radii: np.ndarray, *, tol: float = 1e-4) -> int:
++    """Index ``k`` such that the contact happens between frames ``k`` and ``k+1``.
++
++    Detected as the first change of ball 1's per-frame displacement; returns
++    ``-1`` when the balls never touch inside the video.
++    """
++
++    displacement = np.diff(np.asarray(positions)[:, 0, 0])
++    if displacement.size < 2:
++        return -1
++    changed = np.abs(displacement - displacement[0]) > tol
++    if not changed.any():
++        return -1
++    return int(np.argmax(changed))
++
++
++def window_contains_collision(contact: int, start: int, end: int) -> bool:
++    """Whether a contact between frames ``contact`` and ``contact+1`` lies in ``[start, end]``."""
++
++    return contact >= 0 and start <= contact < end
++
++
++def state_vector(
++    positions: np.ndarray, radii: np.ndarray, t: int, frame_step: int
++) -> np.ndarray:
++    """Normalised ``(10,)`` state of an observation ending at frame ``t``.
++
++    Per ball: ``x, y`` (/10), ``vx, vy`` (finite difference over
++    ``frame_step`` frames, /4 units per second) and radius (/1.5).
++    """
++
++    current = positions[t]
++    previous = positions[t - frame_step]
++    velocity = (current - previous) / (frame_step * FRAME_DT)
++    values = []
++    for ball in range(2):
++        values.extend(current[ball] / POSITION_SCALE)
++        values.extend(velocity[ball] / VELOCITY_SCALE)
++        values.append(radii[ball] / RADIUS_SCALE)
++    return np.asarray(values, dtype=np.float32)
++
++
++def state_to_physical(states: np.ndarray) -> dict[str, np.ndarray]:
++    """Invert :func:`state_vector` on ``(..., 10)`` arrays."""
++
++    states = np.asarray(states, dtype=np.float64).reshape(*np.shape(states)[:-1], 2, 5)
++    return {
++        "position": states[..., 0:2] * POSITION_SCALE,
++        "velocity": states[..., 2:4] * VELOCITY_SCALE,
++        "radius": states[..., 4] * RADIUS_SCALE,
++    }
++
++
++# ---------------------------------------------------------------------------
++# Ball tracking in rendered images
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True, slots=True)
++class BallTrack:
++    """Centroids (world units) and visibility of both balls in a batch of frames."""
++
++    centers: np.ndarray  # (N, 2, 2): frame, ball, xy
++    visible: np.ndarray  # (N, 2) bool
++
++
++def ball_centroids(frames: np.ndarray, *, min_mass: float = 1.0) -> BallTrack:
++    """Locate the red and blue balls in ``(N, H, W, 3)`` frames.
++
++    ``frames`` may be uint8 or floats in ``[0, 1]``.  The weight of a pixel is
++    how strongly it shows one ball's colour (e.g. red: ``R - max(G, B)``), so
++    anti-aliased edges and blurry predictions still give sub-pixel centroids.
++    A ball with total weight below ``min_mass`` pixels is reported invisible.
++    """
++
++    frames = np.asarray(frames, dtype=np.float64)
++    if frames.max(initial=0.0) > 1.0:
++        frames = frames / 255.0
++    if frames.ndim == 3:
++        frames = frames[None]
++    n, height, width, _ = frames.shape
++    red, green, blue = frames[..., 0], frames[..., 1], frames[..., 2]
++    weights = np.stack(
++        [
++            np.clip(red - np.maximum(green, blue), 0.0, 1.0),
++            np.clip(blue - np.maximum(red, green), 0.0, 1.0),
++        ],
++        axis=1,
++    )  # (N, 2, H, W)
++    rows = np.arange(height, dtype=np.float64)
++    cols = np.arange(width, dtype=np.float64)
++    mass = weights.sum(axis=(2, 3))
++    safe = np.maximum(mass, 1e-12)
++    col_center = (weights.sum(axis=2) * cols).sum(axis=-1) / safe
++    row_center = (weights.sum(axis=3) * rows).sum(axis=-1) / safe
++    # Undo the vertical flip and map pixel centres onto PhyWorld's linspace grid.
++    x = col_center / (width - 1) * WORLD_SCALE
++    y = (height - 1 - row_center) / (height - 1) * WORLD_SCALE
++    centers = np.stack([x, y], axis=-1)
++    visible = mass >= min_mass
++    centers[~visible] = np.nan
++    return BallTrack(centers=centers, visible=visible)
++
++
++__all__ = [
++    "BALL_COLORS",
++    "BOX2D_VELOCITY_THRESHOLD",
++    "BallTrack",
++    "FRAME_DT",
++    "ID_RADIUS_RANGE",
++    "ID_VELOCITY_RANGE",
++    "NUM_FRAMES",
++    "STATE_DIM",
++    "WORLD_SCALE",
++    "ball_centroids",
++    "collision_frame",
++    "downsample_frames",
++    "masses",
++    "post_collision_velocities",
++    "render_frames",
++    "sample_initial_positions",
++    "simulate_collision",
++    "state_to_physical",
++    "state_vector",
++    "window_contains_collision",
++]
+diff --git a/src/tasks/phyworld_collision/task.py b/src/tasks/phyworld_collision/task.py
+new file mode 100644
+index 0000000..5ab729d
+--- /dev/null
++++ b/src/tasks/phyworld_collision/task.py
+@@ -0,0 +1,139 @@
++"""Compose the shared NEO model for the PhyWorld collision task.
++
++The theory programmer, program executor and EMA action quantizer are the
++ImageEditing modules (four FiLM blocks each); the observation model and the
++objective are this task's.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import torch
++from torch import nn
++
++from models.neo import NEO
++from tasks.image_editing.models.program_execution import ProgramExecutor
++from tasks.image_editing.models.quantizer import ActionQuantizer, ActionQuantizerConfig
++from tasks.image_editing.models.theory_programmer import LatentProgramConfig, TheoryProgrammer
++from tasks.phyworld_collision.experiment_config import Experiment, TrainingConfig
++from tasks.phyworld_collision.models.vae import ObservationConfig, ObservationVAE
++from tasks.phyworld_collision.objective import CollisionMetrics, PixelObjective, StateObjective
++
++
++def _latent_program_config(training: TrainingConfig, hidden: int, film_layers: int) -> LatentProgramConfig:
++    return LatentProgramConfig(
++        state_dim=training.state_dim,
++        action_dim=training.action_dim,
++        num_state_tokens=training.num_state_tokens,
++        num_action_tokens=training.num_action_tokens,
++        hidden_dim=hidden,
++        num_film_layers=film_layers,
++        dropout=training.dropout,
++        max_transition_length=training.max_transition_length,
++    )
++
++
++def build_objective(observation: ObservationConfig, training: TrainingConfig):
++    if observation.modality == "pixels":
++        return PixelObjective(observation.image_size, observation.channels, training.foreground_weight)
++    return StateObjective(observation.input_dim)
++
++
++class CollisionNEO(NEO[CollisionMetrics]):
++    """Shared NEO with this task's observation model and objective."""
++
++    def __init__(self, experiment: Experiment, observation: ObservationConfig) -> None:
++        training = experiment.training
++        if (training.state_dim, training.num_state_tokens) != (
++            observation.state_dim,
++            observation.num_state_tokens,
++        ):
++            raise ValueError("training.state_dim/num_state_tokens must match the observation model")
++        vae = ObservationVAE(observation)
++        super().__init__(
++            experiment,
++            encoder=vae.encoder,
++            decoder=vae.decoder,
++            objective=build_objective(observation, training),
++            theory_programmer=TheoryProgrammer(
++                _latent_program_config(training, training.policy_hidden_dim, training.policy_film_layers)
++            ),
++            program_executor=ProgramExecutor(
++                _latent_program_config(
++                    training, training.transition_hidden_dim, training.transition_film_layers
++                )
++            ),
++            quantizer=ActionQuantizer(
++                ActionQuantizerConfig(
++                    codebook_size=training.action_codebook_size,
++                    action_dim=training.action_dim,
++                    commitment_weight=training.action_commitment_weight,
++                    entropy_weight=training.action_entropy_weight,
++                    entropy_temperature=training.action_entropy_temperature,
++                    ema_decay=training.action_ema_decay,
++                    ema_epsilon=training.action_ema_epsilon,
++                )
++            ),
++        )
++        self.observation_config = observation
++
++
++def build_neo(experiment: Experiment, observation: ObservationConfig) -> CollisionNEO:
++    return CollisionNEO(experiment, observation)
++
++
++# ---------------------------------------------------------------------------
++# Checkpoints
++# ---------------------------------------------------------------------------
++
++
++def load_observation_checkpoint(path: str | Path) -> tuple[ObservationConfig, dict[str, torch.Tensor]]:
++    """Read a checkpoint written by :mod:`.observation_pretraining`."""
++
++    payload: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
++    if "observation_config" not in payload:
++        raise ValueError(f"{path} has no observation_config; was it written by observation_pretraining?")
++    config = ObservationConfig.from_dict(payload["observation_config"])
++    state = {
++        key: value
++        for key, value in payload["model_state_dict"].items()
++        if key.startswith(("encoder.", "decoder."))
++    }
++    if not state:
++        raise ValueError(f"no encoder/decoder tensors in {path}")
++    return config, state
++
++
++def load_observation_weights(model: nn.Module, state: dict[str, torch.Tensor]) -> int:
++    """Copy pretrained ``encoder.*`` / ``decoder.*`` tensors into a NEO model."""
++
++    missing, unexpected = model.load_state_dict(state, strict=False)
++    if unexpected:
++        raise ValueError(f"unexpected observation keys: {unexpected[:5]}")
++    still_missing = [k for k in missing if k.startswith(("encoder.", "decoder."))]
++    if still_missing:
++        raise ValueError(f"observation checkpoint is missing keys: {still_missing[:5]}")
++    return len(state)
++
++
++def load_neo_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> CollisionNEO:
++    """Rebuild a trained NEO from a checkpoint written by :mod:`.theorizer_runner`."""
++
++    payload = torch.load(path, map_location="cpu", weights_only=False)
++    training = TrainingConfig.from_dict(payload["training_config"])
++    observation = ObservationConfig.from_dict(payload["observation_config"])
++    model = build_neo(Experiment(training), observation)
++    model.load_state_dict(payload["model_state_dict"])
++    return model.to(device).eval()
++
++
++__all__ = [
++    "CollisionNEO",
++    "build_neo",
++    "build_objective",
++    "load_neo_checkpoint",
++    "load_observation_checkpoint",
++    "load_observation_weights",
++]
+diff --git a/src/tasks/phyworld_collision/theorizer_runner.py b/src/tasks/phyworld_collision/theorizer_runner.py
+new file mode 100644
+index 0000000..b62b61f
+--- /dev/null
++++ b/src/tasks/phyworld_collision/theorizer_runner.py
+@@ -0,0 +1,378 @@
++"""Train NEO on PhyWorld collision episodes.
++
++Single GPU::
++
++    python -m tasks.phyworld_collision.theorizer_runner \\
++        --train-h5 data/collision/train.h5 --test-h5 data/collision/id_test.h5 \\
++        --observation-checkpoint runs/collision/observation/pixels-*/checkpoints/best.pt \\
++        --output-root runs/collision/neo --seed 42
++
++Several GPUs (data parallel; the batch size is per GPU)::
++
++    torchrun --standalone --nproc-per-node=2 -m tasks.phyworld_collision.theorizer_runner ...
++
++Change any setting of :class:`experiment_config.TrainingConfig` with
++``--set name=value`` (repeatable), e.g. ``--set action_codebook_size=4
++--set epochs=100``.  The observation model is frozen; the run directory gets
++``checkpoints/best.pt`` (lowest ID query transfer loss, the paper's selection
++rule), periodic checkpoints and ``final.pt``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import time
++from dataclasses import replace
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++import torch
++from torch.nn.parallel import DistributedDataParallel
++from torch.optim import AdamW
++from torch.utils.data import DataLoader, DistributedSampler, Subset
++
++from tasks.phyworld_collision.data.dataset import (
++    EpisodeBatch,
++    EpisodeDataset,
++    collate_episodes,
++    load_metadata,
++)
++from tasks.phyworld_collision.experiment_config import Experiment, TrainingConfig, apply_overrides
++from tasks.phyworld_collision.task import (
++    build_neo,
++    load_observation_checkpoint,
++    load_observation_weights,
++)
++from training.optimization import (
++    OptimizationConfig,
++    build_cosine_warmup_scheduler,
++    optimization_step,
++)
++from training.runtime import (
++    ExperimentTrackingConfig,
++    MetricLog,
++    barrier,
++    bfloat16_autocast,
++    capture_git_source,
++    create_run_directory,
++    initialize_distributed,
++    seed_everything,
++)
++
++
++def build_optimizer(model: torch.nn.Module, training: TrainingConfig) -> AdamW:
++    """AdamW with the paper's slower programmer and executor learning rates."""
++
++    programmer, executor, remainder = [], [], []
++    for name, parameter in model.named_parameters():
++        if not parameter.requires_grad:
++            continue
++        if name.startswith("theory_programmer."):
++            programmer.append(parameter)
++        elif name.startswith("program_executor."):
++            executor.append(parameter)
++        else:
++            remainder.append(parameter)
++    base = training.learning_rate
++    groups = [
++        {"params": programmer, "lr": base * training.policy_learning_rate_scale},
++        {"params": executor, "lr": base * training.transition_learning_rate_scale},
++        {"params": remainder, "lr": base},
++    ]
++    return AdamW([g for g in groups if g["params"]], lr=base, weight_decay=training.weight_decay)
++
++
++def forward(model, batch: EpisodeBatch, *, is_eval: bool, coefficient: float, num_transitions=None):
++    with bfloat16_autocast(batch.observations.device):
++        return model(
++            batch.observations,
++            is_eval=is_eval,
++            length_control_coefficient=coefficient,
++            num_transitions=num_transitions,
++        )
++
++
++@torch.no_grad()
++def evaluate(model, loader, device, *, coefficient: float, deltas: np.ndarray) -> dict[str, float]:
++    """ID query transfer: program inferred on the support pair, applied to the query pair."""
++
++    model.eval()
++    keys = (
++        "support_loss",
++        "query_loss",
++        "query_l1",
++        "query_foreground_l1",
++        "mean_explanation_length",
++        "length_matches_delta",
++    )
++    sums = dict.fromkeys(keys, 0.0)
++    count = 0
++    codes_used: set[int] = set()
++    for batch in loader:
++        batch = batch.to(device)
++        output = forward(model, batch, is_eval=True, coefficient=coefficient)
++        support_lengths = output.selected_lengths[::2].cpu().numpy()
++        true_deltas = deltas[batch.indices.numpy()]
++        record = {
++            "support_loss": float(output.reconstruction_loss),
++            "query_loss": float(output.query_reconstruction_loss),
++            "query_l1": float(output.query_metrics.l1),
++            "query_foreground_l1": float(output.query_metrics.foreground_l1),
++            "mean_explanation_length": float(support_lengths.mean()),
++            "length_matches_delta": float((support_lengths == true_deltas).mean()),
++        }
++        for key, value in record.items():
++            sums[key] += value * len(batch)
++        count += len(batch)
++        codes_used.update(output.action_vq_by_length[0].indices[::2].cpu().tolist())
++    if torch.distributed.is_initialized():
++        totals = torch.tensor([*sums.values(), count], dtype=torch.float64, device=device)
++        torch.distributed.all_reduce(totals)
++        sums = dict(zip(sums, totals[:-1].tolist()))
++        count = totals[-1].item()
++    result = {key: value / max(count, 1) for key, value in sums.items()}
++    result["codes_used_first_step"] = float(len(codes_used))
++    return result
++
++
++def run(arguments: argparse.Namespace) -> Path:
++    context = initialize_distributed(force_cpu=arguments.cpu)
++    seed_everything(arguments.seed + context.rank)
++    device = context.device
++
++    observation, observation_state = load_observation_checkpoint(arguments.observation_checkpoint)
++    training = apply_overrides(TrainingConfig(), arguments.set or [])
++    training = replace(
++        training, state_dim=observation.state_dim, num_state_tokens=observation.num_state_tokens
++    )
++    experiment = Experiment(training)
++
++    train_set = EpisodeDataset(arguments.train_h5, observation.modality)
++    test_set = EpisodeDataset(arguments.test_h5, observation.modality)
++    data_deltas = [int(d) for d in np.atleast_1d(train_set.attributes["deltas"])]
++    if max(data_deltas) > training.max_transition_length:
++        print(
++            f"warning: training deltas go up to {max(data_deltas)} but max_transition_length is "
++            f"{training.max_transition_length}; a program cannot apply one primitive per step",
++            flush=True,
++        )
++    if observation.modality == "pixels" and int(train_set.attributes["image_size"]) != observation.image_size:
++        raise ValueError("episode image_size differs from the observation model's")
++    test_deltas = load_metadata(test_set.path).delta
++
++    model = build_neo(experiment, observation)
++    loaded = load_observation_weights(model, observation_state)
++    model.to(device)
++    core = model
++    if context.is_distributed:
++        model = DistributedDataParallel(
++            model,
++            device_ids=[context.local_rank] if device.type == "cuda" else None,
++            find_unused_parameters=True,  # the programmer keeps unused FiLM parameters
++        )
++
++    sampler = None
++    if context.is_distributed:
++        sampler = DistributedSampler(
++            train_set, num_replicas=context.world_size, rank=context.rank, shuffle=True, seed=arguments.seed
++        )
++        test_subset = Subset(test_set, range(context.rank, len(test_set), context.world_size))
++    else:
++        test_subset = test_set
++    generator = torch.Generator().manual_seed(arguments.seed)
++    train_loader = DataLoader(
++        train_set,
++        batch_size=training.batch_size,
++        shuffle=sampler is None,
++        sampler=sampler,
++        num_workers=training.num_workers,
++        collate_fn=collate_episodes,
++        pin_memory=device.type == "cuda",
++        drop_last=len(train_set) > training.batch_size * context.world_size,
++        generator=generator,
++        persistent_workers=training.num_workers > 0,
++    )
++    test_loader = DataLoader(
++        test_subset,
++        batch_size=training.batch_size,
++        shuffle=False,
++        num_workers=training.num_workers,
++        collate_fn=collate_episodes,
++    )
++
++    total_steps = training.epochs * max(len(train_loader), 1)
++    optimization = OptimizationConfig(
++        total_steps=total_steps,
++        learning_rate=training.learning_rate,
++        weight_decay=training.weight_decay,
++        max_gradient_norm=training.gradient_clip_norm,
++        warmup_ratio=training.warmup_ratio,
++        minimum_learning_rate_ratio=training.minimum_learning_rate_ratio,
++    )
++    optimizer = build_optimizer(core, training)
++    scheduler = build_cosine_warmup_scheduler(optimizer, optimization)
++
++    run_name = arguments.run_name or f"collision-neo-{observation.modality}-seed{arguments.seed}"
++    run_directory = create_run_directory(
++        arguments.output_root,
++        run_name,
++        capture_git_source(Path(__file__).resolve().parents[3]),
++        context,
++    )
++    resolved = {
++        "task": "phyworld_collision",
++        "seed": arguments.seed,
++        "train_h5": str(train_set.path),
++        "test_h5": str(test_set.path),
++        "observation_checkpoint": str(Path(arguments.observation_checkpoint).resolve()),
++        "observation_tensors_loaded": loaded,
++        "total_steps": total_steps,
++        "world_size": context.world_size,
++        "data_deltas": data_deltas,
++        "frame_step": int(train_set.attributes["frame_step"]),
++        **{f"observation.{k}": v for k, v in observation.to_dict().items()},
++        **{f"training.{k}": v for k, v in training.to_dict().items()},
++    }
++    log: MetricLog | None = None
++    if context.is_global_zero:
++        (run_directory / "checkpoints").mkdir(exist_ok=True)
++        (run_directory / "config.json").write_text(json.dumps(resolved, indent=2))
++        log = MetricLog(
++            run_directory / "metrics.jsonl",
++            ExperimentTrackingConfig(
++                project=arguments.wandb_project,
++                name=run_name,
++                entity=arguments.wandb_entity,
++                group=arguments.wandb_group,
++                mode=arguments.wandb_mode,
++            ),
++            resolved,
++        )
++
++    def coefficient_at(step: int) -> float:
++        return experiment.scheduled_length_control(step / max(total_steps, 1))
++
++    def save(name: str, epoch: int, global_step: int, evaluation: dict) -> None:
++        torch.save(
++            {
++                "model_state_dict": core.state_dict(),
++                "optimizer_state_dict": optimizer.state_dict(),
++                "scheduler_state_dict": scheduler.state_dict(),
++                "training_config": training.to_dict(),
++                "observation_config": observation.to_dict(),
++                "frame_step": int(train_set.attributes["frame_step"]),
++                "epoch": epoch,
++                "global_step": global_step,
++                "evaluation": evaluation,
++                "config": resolved,
++            },
++            run_directory / "checkpoints" / name,
++        )
++
++    exit_code = 1
++    best = math.inf
++    evaluation: dict[str, float] = {}
++    try:
++        global_step = 0
++        started = time.monotonic()
++        for epoch in range(training.epochs):
++            if sampler is not None:
++                sampler.set_epoch(epoch)
++            for batch in train_loader:
++                coefficient = coefficient_at(global_step)
++                result = optimization_step(
++                    model,
++                    batch.to(device),
++                    lambda m, b, c=coefficient: forward(m, b, is_eval=False, coefficient=c),
++                    optimizer,
++                    scheduler,
++                    global_step=global_step,
++                    max_gradient_norm=training.gradient_clip_norm,
++                )
++                core.quantizer.step()
++                global_step = result.global_step
++                if log is not None and (
++                    global_step % training.log_interval_steps == 0 or global_step == total_steps
++                ):
++                    output = result.objective
++                    log.log(
++                        {
++                            "train/step": global_step,
++                            "train/epoch": epoch,
++                            "train/loss": float(output.loss.detach()),
++                            "train/reconstruction_loss": float(output.reconstruction_loss.detach()),
++                            "train/grounding_loss": float(output.transition_consistency_loss.detach()),
++                            "train/state_prediction_loss": float(output.state_prediction_loss.detach()),
++                            "train/action_vq_loss": float(output.action_vq_loss.detach()),
++                            "train/foreground_l1": float(output.metrics.foreground_l1),
++                            "train/mean_explanation_length": float(output.mean_explanation_length),
++                            "train/gradient_norm": float(result.gradient_norm),
++                            "train/learning_rate": result.learning_rates[-1],
++                            "train/length_control_coefficient": coefficient,
++                        }
++                    )
++            evaluation = evaluate(
++                core, test_loader, device, coefficient=coefficient_at(global_step), deltas=test_deltas
++            )
++            if log is not None:
++                log.log({"eval/step": global_step, "eval/epoch": epoch, **{f"eval/{k}": v for k, v in evaluation.items()}})
++                print(json.dumps({"epoch": epoch, "step": global_step, **evaluation}), flush=True)
++            if context.is_global_zero:
++                if evaluation["query_loss"] < best:
++                    best = evaluation["query_loss"]
++                    save("best.pt", epoch, global_step, evaluation)
++                if (epoch + 1) % training.checkpoint_interval_epochs == 0:
++                    save(f"checkpoint_{global_step}.pt", epoch, global_step, evaluation)
++        if context.is_global_zero:
++            save("final.pt", training.epochs - 1, global_step, evaluation)
++            (run_directory / "result.json").write_text(
++                json.dumps(
++                    {
++                        "status": "completed",
++                        "global_step": global_step,
++                        "seconds": time.monotonic() - started,
++                        "best_query_loss": best,
++                        "final_evaluation": evaluation,
++                    },
++                    indent=2,
++                )
++            )
++        exit_code = 0
++    finally:
++        if log is not None:
++            log.finish(exit_code=exit_code)
++        barrier(context)
++        if context.owns_process_group:
++            torch.distributed.destroy_process_group()
++    return run_directory
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--train-h5", type=Path, required=True)
++    parser.add_argument("--test-h5", type=Path, required=True)
++    parser.add_argument("--observation-checkpoint", type=Path, required=True)
++    parser.add_argument("--output-root", type=Path, required=True)
++    parser.add_argument("--seed", type=int, default=42)
++    parser.add_argument("--set", action="append", metavar="NAME=VALUE", help="override a TrainingConfig field")
++    parser.add_argument("--run-name")
++    parser.add_argument("--wandb-project", default="LearningToTheorize")
++    parser.add_argument("--wandb-entity")
++    parser.add_argument("--wandb-group")
++    parser.add_argument("--wandb-mode", choices=("online", "offline", "disabled"), default="disabled")
++    parser.add_argument("--cpu", action="store_true", help="force CPU (smoke tests)")
++    return parser
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    arguments = build_parser().parse_args(argv)
++    run_directory = run(arguments)
++    print(json.dumps({"run_directory": str(run_directory)}))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tasks/phyworld_collision/visualize.py b/src/tasks/phyworld_collision/visualize.py
+new file mode 100644
+index 0000000..02e36c9
+--- /dev/null
++++ b/src/tasks/phyworld_collision/visualize.py
+@@ -0,0 +1,48 @@
++"""Small PNG helpers for checking reconstructions and predictions by eye."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Sequence
++
++import numpy as np
++
++
++def _to_uint8(image: np.ndarray) -> np.ndarray:
++    image = np.asarray(image, dtype=np.float64)
++    if image.max(initial=0.0) <= 1.0:
++        image = image * 255.0
++    return np.clip(np.round(image), 0, 255).astype(np.uint8)
++
++
++def frame_pair(observation: np.ndarray) -> np.ndarray:
++    """``(S, S, 6)`` observation -> ``(S, 2S, 3)``: earlier frame | later frame."""
++
++    observation = _to_uint8(observation)
++    return np.concatenate([observation[..., :3], observation[..., 3:6]], axis=1)
++
++
++def save_rows(path: str | Path, rows: Sequence[Sequence[np.ndarray]], *, scale: int = 2, gap: int = 4) -> None:
++    """Save a grid; each cell is an ``(S, S, 6)`` observation shown as two frames."""
++
++    from PIL import Image
++
++    cells = [[frame_pair(cell) for cell in row] for row in rows]
++    height = max(cell.shape[0] for row in cells for cell in row)
++    width = max(cell.shape[1] for row in cells for cell in row)
++    columns = max(len(row) for row in cells)
++    canvas = np.full(
++        (len(cells) * (height + gap) + gap, columns * (width + gap) + gap, 3), 128, dtype=np.uint8
++    )
++    for r, row in enumerate(cells):
++        for c, cell in enumerate(row):
++            y, x = gap + r * (height + gap), gap + c * (width + gap)
++            canvas[y : y + cell.shape[0], x : x + cell.shape[1]] = cell
++    image = Image.fromarray(canvas)
++    if scale != 1:
++        image = image.resize((canvas.shape[1] * scale, canvas.shape[0] * scale), Image.NEAREST)
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    image.save(path)
++
++
++__all__ = ["frame_pair", "save_rows"]
+diff --git a/tests/test_phyworld_collision.py b/tests/test_phyworld_collision.py
+new file mode 100644
+index 0000000..9480191
+--- /dev/null
++++ b/tests/test_phyworld_collision.py
+@@ -0,0 +1,192 @@
++"""PhyWorld collision task: physics, data, models and a CPU end-to-end run.
++
++Run with ``CUDA_VISIBLE_DEVICES= python -m pytest -q tests/test_phyworld_collision.py``.
++The end-to-end test takes a minute or two on CPU.
++"""
++
++from __future__ import annotations
++
++import json
++
++import numpy as np
++import pytest
++
++from tasks.phyworld_collision import physics as P
++from tasks.phyworld_collision.data import episodes as E
++from tasks.phyworld_collision.data.simulate import preset_combinations, simulate_videos
++
++
++@pytest.fixture(scope="module")
++def videos():
++    rng = np.random.default_rng(0)
++    combinations = preset_combinations("tiny", rng)
++    return simulate_videos(combinations, rng)
++
++
++# ---------------------------------------------------------------------------
++# NumPy only
++# ---------------------------------------------------------------------------
++
++
++def test_elastic_collision_conserves_momentum_and_energy(videos):
++    positions, init = videos
++    for p, (r1, r2, v1, v2) in zip(positions[:20], init[:20]):
++        m1, m2 = P.masses(r1, r2)
++        velocity = np.diff(p[:, :, 0], axis=0) / P.FRAME_DT
++        before, after = velocity[0], velocity[-1]
++        assert np.isclose(m1 * before[0] + m2 * before[1], m1 * after[0] + m2 * after[1])
++        assert np.isclose(m1 * before[0] ** 2 + m2 * before[1] ** 2, m1 * after[0] ** 2 + m2 * after[1] ** 2)
++        assert P.collision_frame(p, np.array([r1, r2])) >= P.MIN_PRE_FRAMES - 1
++
++
++def test_slow_contacts_are_inelastic_like_box2d():
++    w1, w2 = P.post_collision_velocities(1.0, 1.0, 0.3, -0.2, inelastic_threshold=1.0)
++    assert np.isclose(w1, w2) and np.isclose(w1, 0.05)
++
++
++def test_rendering_and_tracking_agree(videos):
++    positions, init = videos
++    frames = P.render_frames(positions[0], init[0, :2], 64)
++    track = P.ball_centroids(frames)
++    inside = np.ones(positions.shape[1], dtype=bool)
++    for ball in range(2):
++        r = init[0, ball]
++        inside &= (positions[0, :, ball, 0] - r >= 0) & (positions[0, :, ball, 0] + r <= P.WORLD_SCALE)
++    error = np.linalg.norm(track.centers[inside] - positions[0][inside], axis=-1)
++    assert error.max() < 0.05
++
++
++def test_episode_shapes_and_collision_control(videos):
++    positions, init = videos
++    rng = np.random.default_rng(1)
++    source = E.rendered_frame_source(positions, init[:, :2], 64)
++    record = E.build_episode(
++        rng, support_video=0, query_video=1, delta=3, frame_step=2, positions=positions,
++        init=init, first_index=0, frame_source=source, collision_fraction=1.0,
++    )
++    assert record.grids.shape == (4, 64, 64, 6) and record.grids.dtype == np.uint8
++    assert record.states.shape == (4, P.STATE_DIM)
++    assert record.collides.all()
++    physical = P.state_to_physical(record.states)
++    assert np.allclose(physical["position"], record.positions[:, 1], atol=1e-4)
++    with pytest.raises(ValueError):
++        E.valid_start_range(20, 2, 32)
++
++
++def test_video_split_is_disjoint_and_classification():
++    train = E.video_split_mask(500, "train", test_fraction=0.1, split_seed=0)
++    test = E.video_split_mask(500, "test", test_fraction=0.1, split_seed=0)
++    assert not (train & test).any() and (train | test).all()
++    labels = E.classify_videos(np.array([[1, 1, 2, 2], [1, 1, 5, 2], [1.8, 1, 2, 2], [0.3, 1, 0.1, 2]]))
++    assert list(labels) == ["id", "ood-velocity", "ood-radius", "ood-both"]
++
++
++# ---------------------------------------------------------------------------
++# HDF5 + PyTorch
++# ---------------------------------------------------------------------------
++
++
++@pytest.fixture(scope="module")
++def episode_files(tmp_path_factory, videos):
++    pytest.importorskip("h5py")
++    from tasks.phyworld_collision.data import convert
++    from tasks.phyworld_collision.data.phyworld_hdf5 import write_phyworld_file
++
++    root = tmp_path_factory.mktemp("collision")
++    positions, init = videos
++    write_phyworld_file(root / "source.hdf5", positions, init, chunk_size=64)
++    files = {}
++    for name, videos_split, deltas, count in (
++        ("train", "train", "1,2,3,4", 96),
++        ("test", "test", "1,2,3,4", 24),
++        ("length", "test", "5,6", 16),
++    ):
++        arguments = convert.build_parser().parse_args(
++            ["--source", str(root / "source.hdf5"), "--output", str(root / f"{name}.h5"),
++             "--episodes", str(count), "--deltas", deltas, "--videos", videos_split,
++             "--test-fraction", "0.3"]
++        )
++        summary = convert.convert(arguments)
++        assert summary["episodes"] == count
++        files[name] = root / f"{name}.h5"
++    return root, files
++
++
++def test_converted_files(episode_files):
++    torch = pytest.importorskip("torch")
++    from tasks.phyworld_collision.data.dataset import EpisodeDataset, ObservationDataset, load_metadata
++
++    _, files = episode_files
++    dataset = EpisodeDataset(files["train"], "pixels")
++    observations, index = dataset[3]
++    assert observations.shape == (4, 64, 64, 6) and observations.dtype == torch.uint8 and index == 3
++    states, _ = EpisodeDataset(files["train"], "states")[3]
++    assert states.shape == (4, P.STATE_DIM)
++    assert len(ObservationDataset(files["train"], "pixels")) == 4 * len(dataset)
++    metadata = load_metadata(files["length"])
++    assert set(np.unique(metadata.delta)) <= {5, 6}
++
++
++@pytest.mark.parametrize("modality", ["pixels", "states"])
++def test_neo_forward_train_and_eval(modality, episode_files):
++    torch = pytest.importorskip("torch")
++    from tasks.phyworld_collision.data.dataset import EpisodeDataset, collate_episodes
++    from tasks.phyworld_collision.experiment_config import Experiment, TrainingConfig
++    from tasks.phyworld_collision.models.vae import ObservationConfig
++    from tasks.phyworld_collision.task import build_neo
++
++    _, files = episode_files
++    observation = ObservationConfig(modality=modality, state_dim=32, base_channels=16, bottleneck_channels=32)
++    training = TrainingConfig(state_dim=32, policy_hidden_dim=32, transition_hidden_dim=32, batch_size=4)
++    model = build_neo(Experiment(training), observation)
++    batch = collate_episodes([EpisodeDataset(files["train"], modality)[i] for i in range(4)])
++    model.train()
++    output = model(batch.observations, is_eval=False)
++    output.loss.backward()
++    assert torch.isfinite(output.loss)
++    model.eval()
++    with torch.no_grad():
++        output = model(batch.observations, is_eval=True, num_transitions=6)
++    assert output.query_metrics is not None and output.selected_lengths.shape == (8,)
++    assert torch.equal(output.selected_lengths[::2], output.selected_lengths[1::2])
++
++
++def test_end_to_end_cpu(episode_files, tmp_path):
++    pytest.importorskip("torch")
++    from tasks.phyworld_collision import evaluation, observation_pretraining, theorizer_runner
++
++    _, files = episode_files
++    observation_run = observation_pretraining.run(
++        observation_pretraining.build_parser().parse_args(
++            ["--train-h5", str(files["train"]), "--test-h5", str(files["test"]),
++             "--output-root", str(tmp_path / "observation"), "--epochs", "1", "--batch-size", "32",
++             "--num-workers", "0", "--state-dim", "32", "--base-channels", "16",
++             "--bottleneck-channels", "32", "--cpu"]
++        )
++    )
++    observation_checkpoint = observation_run / "checkpoints" / "best.pt"
++    assert observation_checkpoint.exists()
++    assert list(observation_run.glob("reconstructions_epoch*.png"))
++
++    neo_run = theorizer_runner.run(
++        theorizer_runner.build_parser().parse_args(
++            ["--train-h5", str(files["train"]), "--test-h5", str(files["test"]),
++             "--observation-checkpoint", str(observation_checkpoint),
++             "--output-root", str(tmp_path / "neo"), "--cpu",
++             "--set", "epochs=1", "--set", "batch_size=16", "--set", "num_workers=0",
++             "--set", "policy_hidden_dim=32", "--set", "transition_hidden_dim=32"]
++        )
++    )
++    neo_checkpoint = neo_run / "checkpoints" / "best.pt"
++    assert neo_checkpoint.exists()
++    assert json.loads((neo_run / "result.json").read_text())["status"] == "completed"
++
++    output_dir = tmp_path / "evaluation"
++    evaluation.main(
++        ["--checkpoint", str(neo_checkpoint), "--output-dir", str(output_dir), "--cpu",
++         "--batch-size", "8", "--split", f"id={files['test']}", "--split", f"length={files['length']}"]
++    )
++    report = json.loads((output_dir / "evaluation.json").read_text())
++    assert report["length"]["num_transitions"] == 6
++    assert report["id"]["all"]["episodes"] == 24
++    assert (output_dir / "id_examples.png").exists()
