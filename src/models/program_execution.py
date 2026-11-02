@@ -1,6 +1,4 @@
 """Latent program execution for one quantized operation."""
-"""Program Execution is desribed in 3.2 chapter to help calculate latent dimensions of steps, and used to apply to program for current latent state, to obtain next probability of the next latent state"""
-
 
 from __future__ import annotations
 

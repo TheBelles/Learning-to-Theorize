@@ -86,8 +86,8 @@ class TrainingConfig:
             raise ValueError("epochs and batch_size must be positive")
         if self.max_transition_length < 1:
             raise ValueError("max_transition_length must be positive")
-        if self.action_codebook_size < 2:
-            raise ValueError("action_codebook_size must be at least 2")
+        if self.action_codebook_size < 1:
+            raise ValueError("action_codebook_size must be at least 1")
 
     @property
     def action_tau_steps(self) -> int:
